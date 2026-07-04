@@ -393,6 +393,14 @@ impl SimpleScheduler {
 
         let start = Instant::now();
 
+        if !self
+            .worker_scheduler
+            .has_available_worker(full_worker_logging)
+            .await
+        {
+            return Ok(());
+        }
+
         let mut stream = self
             .get_queued_operations()
             .await
@@ -406,7 +414,14 @@ impl SimpleScheduler {
             );
         }
 
-        while let Some(action_state_result) = stream.next().await {
+        while self
+            .worker_scheduler
+            .has_available_worker(full_worker_logging)
+            .await
+        {
+            let Some(action_state_result) = stream.next().await else {
+                break;
+            };
             result = result.merge(
                 match_action_to_worker(
                     action_state_result.as_ref(),

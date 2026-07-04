@@ -183,6 +183,16 @@ impl ApiWorkerSchedulerImpl {
         Ok(())
     }
 
+    fn any_worker_can_accept_work(&self, full_worker_logging: bool) -> bool {
+        if !self.workers.iter().any(|(_, w)| w.can_accept_work()) {
+            if full_worker_logging {
+                info!("All workers are fully allocated");
+            }
+            return false;
+        }
+        true
+    }
+
     /// Adds a worker to the pool.
     /// Note: This function will not do any task matching.
     fn add_worker(&mut self, worker: Worker) -> Result<(), Error> {
@@ -245,10 +255,7 @@ impl ApiWorkerSchedulerImpl {
         full_worker_logging: bool,
     ) -> Option<WorkerId> {
         // Do a fast check to see if any workers are available at all for work allocation
-        if !self.workers.iter().any(|(_, w)| w.can_accept_work()) {
-            if full_worker_logging {
-                info!("All workers are fully allocated");
-            }
+        if !self.any_worker_can_accept_work(full_worker_logging) {
             return None;
         }
 
@@ -568,6 +575,12 @@ impl ApiWorkerScheduler {
     #[must_use]
     pub const fn get_metrics(&self) -> &Arc<SchedulerMetrics> {
         &self.metrics
+    }
+
+    /// Returns true if at least one worker can accept any work right now.
+    pub async fn has_available_worker(&self, full_worker_logging: bool) -> bool {
+        let inner = self.inner.lock().await;
+        inner.any_worker_can_accept_work(full_worker_logging)
     }
 
     /// Attempts to find a worker that is capable of running this action.
