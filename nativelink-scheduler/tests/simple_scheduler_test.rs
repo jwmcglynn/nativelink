@@ -91,8 +91,17 @@ async fn setup_new_worker(
     worker_id: WorkerId,
     props: PlatformProperties,
 ) -> Result<mpsc::UnboundedReceiver<UpdateForWorker>, Error> {
+    setup_new_worker_with_max_inflight_tasks(scheduler, worker_id, props, 0).await
+}
+
+async fn setup_new_worker_with_max_inflight_tasks(
+    scheduler: &SimpleScheduler,
+    worker_id: WorkerId,
+    props: PlatformProperties,
+    max_inflight_tasks: u64,
+) -> Result<mpsc::UnboundedReceiver<UpdateForWorker>, Error> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let worker = Worker::new(worker_id.clone(), props, tx, NOW_TIME, 0);
+    let worker = Worker::new(worker_id.clone(), props, tx, NOW_TIME, max_inflight_tasks);
     scheduler
         .add_worker(worker)
         .await
@@ -1110,6 +1119,65 @@ async fn matching_engine_fails_sends_abort() -> Result<(), Error> {
             Code::Internal
         );
     }
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn do_try_match_returns_without_scanning_queue_when_all_workers_full() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let (senders, awaited_action) = RxMockAwaitedAction::new();
+
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        awaited_action,
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    // Initial worker registration triggers a match pass; provide an empty queue.
+    senders.get_range_of_actions.send(vec![]).unwrap();
+    let mut worker_rx = setup_new_worker_with_max_inflight_tasks(
+        &scheduler,
+        WorkerId("worker_id".to_string()),
+        PlatformProperties::default(),
+        1,
+    )
+    .await?;
+
+    // Fill the worker's only inflight slot.
+    senders
+        .get_awaited_action_by_id
+        .send(Ok(Some(MockAwaitedActionSubscriber {})))
+        .unwrap();
+    senders
+        .get_by_operation_id
+        .send(Ok(Some(MockAwaitedActionSubscriber {})))
+        .unwrap();
+    senders
+        .get_range_of_actions
+        .send(vec![Ok(MockAwaitedActionSubscriber {})])
+        .unwrap();
+    senders.update_awaited_action.send(Ok(())).unwrap();
+
+    scheduler.do_try_match_for_test().await?;
+    let update_for_worker = worker_rx
+        .recv()
+        .await
+        .expect("Worker should receive a start action")
+        .update
+        .expect("Worker update should be set");
+    assert!(matches!(
+        update_for_worker,
+        update_for_worker::Update::StartAction(_)
+    ));
+
+    // Before the fast-path fix this attempted to scan queued actions even
+    // though no worker could accept work, which repeatedly hit the full-worker
+    // path once per queued action.
+    scheduler.do_try_match_for_test().await?;
 
     Ok(())
 }
