@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nativelink_config::cas_server::HttpServerConfig;
 use nativelink_config::serde_utils::{
     convert_boolean_with_shellexpand, convert_data_size_with_shellexpand,
     convert_duration_with_shellexpand, convert_numeric_with_shellexpand,
@@ -78,6 +79,26 @@ struct VecStringEntity {
 struct BoolEntity {
     #[serde(default, deserialize_with = "convert_boolean_with_shellexpand")]
     value: bool,
+}
+
+#[test]
+fn test_http_server_connection_hardening_config() {
+    let deserialized: HttpServerConfig = serde_json5::from_str(
+        r#"{
+            max_open_connections: 1024,
+            experimental_tls_handshake_timeout: 10,
+            experimental_connection_timeout: 21600,
+            http2_keep_alive_interval: 30,
+            experimental_http2_keep_alive_timeout: 10,
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(deserialized.max_open_connections, Some(1024));
+    assert_eq!(deserialized.experimental_tls_handshake_timeout, Some(10));
+    assert_eq!(deserialized.experimental_connection_timeout, Some(21600));
+    assert_eq!(deserialized.http2_keep_alive_interval, Some(30));
+    assert_eq!(deserialized.experimental_http2_keep_alive_timeout, Some(10));
 }
 
 mod duration_tests {

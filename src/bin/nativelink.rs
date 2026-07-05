@@ -25,7 +25,7 @@ use clap::Parser;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Either, OptionFuture, TryFutureExt, try_join_all};
 use hyper::StatusCode;
-use hyper_util::rt::tokio::TokioIo;
+use hyper_util::rt::tokio::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
@@ -69,7 +69,8 @@ use tokio::select;
 #[cfg(target_family = "unix")]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot::Sender;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
@@ -90,6 +91,11 @@ const DEFAULT_HEALTH_STATUS_CHECK_PATH: &str = "/status";
 // Note: This must be kept in sync with the documentation in
 // `OriginEventsConfig::max_event_queue_size`.
 const DEFAULT_MAX_QUEUE_EVENTS: usize = 0x0001_0000;
+
+const DEFAULT_MAX_OPEN_CONNECTIONS: usize = 2048;
+const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
+const DEFAULT_HTTP2_KEEP_ALIVE_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
 /// Broadcast Channel Capacity
 /// Note: The actual capacity may be greater than the provided capacity.
@@ -545,10 +551,40 @@ async fn inner_main(
         let mut http = auto::Builder::new(TaskExecutor::default());
 
         let http_config = &http_config.advanced_http;
-        if let Some(value) = http_config.http2_keep_alive_interval {
-            http.http2()
-                .keep_alive_interval(Duration::from_secs(u64::from(value)));
-        }
+        let max_open_connections =
+            match http_config.max_open_connections {
+                Some(0) => Err(make_input_err!(
+                    "max_open_connections must be greater than 0 for {socket_addr}"
+                ))?,
+                Some(value) => Some(usize::try_from(value).err_tip(|| {
+                    format!("Could not convert max_open_connections for {socket_addr}")
+                })?),
+                None => Some(DEFAULT_MAX_OPEN_CONNECTIONS),
+            };
+        let tls_handshake_timeout = match http_config.experimental_tls_handshake_timeout {
+            Some(0) => Err(make_input_err!(
+                "experimental_tls_handshake_timeout must be greater than 0 for {socket_addr}"
+            ))?,
+            Some(value) => Some(Duration::from_secs(u64::from(value))),
+            None => Some(Duration::from_secs(DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS)),
+        };
+        let connection_timeout = match http_config.experimental_connection_timeout {
+            Some(0) => Err(make_input_err!(
+                "experimental_connection_timeout must be greater than 0 for {socket_addr}"
+            ))?,
+            Some(value) => Some(Duration::from_secs(u64::from(value))),
+            None => None,
+        };
+        let connection_limiter = max_open_connections.map(|max| Arc::new(Semaphore::new(max)));
+
+        http.http2()
+            .timer(TokioTimer::new())
+            .keep_alive_interval(Duration::from_secs(
+                http_config
+                    .http2_keep_alive_interval
+                    .map(u64::from)
+                    .unwrap_or(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS),
+            ));
 
         if let Some(value) = http_config.experimental_http2_max_pending_accept_reset_streams {
             http.http2()
@@ -571,10 +607,12 @@ async fn inner_main(
         if let Some(value) = http_config.experimental_http2_max_concurrent_streams {
             http.http2().max_concurrent_streams(value);
         }
-        if let Some(value) = http_config.experimental_http2_keep_alive_timeout {
-            http.http2()
-                .keep_alive_timeout(Duration::from_secs(u64::from(value)));
-        }
+        http.http2().keep_alive_timeout(Duration::from_secs(
+            http_config
+                .experimental_http2_keep_alive_timeout
+                .map(u64::from)
+                .unwrap_or(DEFAULT_HTTP2_KEEP_ALIVE_TIMEOUT_SECS),
+        ));
         if let Some(value) = http_config.experimental_http2_max_send_buf_size {
             http.http2().max_send_buf_size(
                 usize::try_from(value).err_tip(|| "Could not convert http2_max_send_buf_size")?,
@@ -587,12 +625,41 @@ async fn inner_main(
             http.http2().max_header_list_size(value);
         }
         info!("Ready, listening on {socket_addr}",);
+        let listener_shutdown_tx = shutdown_tx.clone();
         root_futures.push(Box::pin(async move {
+            let mut listener_shutdown_rx = listener_shutdown_tx.subscribe();
             loop {
                 select! {
+                    biased;
+                    shutdown_result = listener_shutdown_rx.recv() => {
+                        if let Err(err) = shutdown_result {
+                            warn!(?err, ?socket_addr, "Listener shutdown channel closed");
+                        }
+                        info!(?socket_addr, "Shutting down listener");
+                        break;
+                    },
                     accept_result = tcp_listener.accept() => {
                         match accept_result {
                             Ok((tcp_stream, remote_addr)) => {
+                                let connection_permit = if let Some(connection_limiter) = &connection_limiter {
+                                    match connection_limiter.clone().try_acquire_owned() {
+                                        Ok(connection_permit) => Some(connection_permit),
+                                        Err(err) => {
+                                            warn!(
+                                                target: "nativelink::services",
+                                                ?err,
+                                                ?remote_addr,
+                                                ?socket_addr,
+                                                ?max_open_connections,
+                                                "Rejected connection because listener connection limit is reached"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+
                                 info!(
                                     target: "nativelink::services",
                                     ?remote_addr,
@@ -602,6 +669,7 @@ async fn inner_main(
 
                                 let (http, svc, maybe_tls_acceptor) =
                                     (http.clone(), svc.clone(), maybe_tls_acceptor.clone());
+                                let mut connection_shutdown_rx = listener_shutdown_tx.subscribe();
 
                                 background_spawn!(
                                     name: "http_connection",
@@ -610,30 +678,85 @@ async fn inner_main(
                                         remote_addr = %remote_addr,
                                         socket_addr = %socket_addr,
                                     ).in_scope(|| async move {
-                                        let serve_connection = if let Some(tls_acceptor) = maybe_tls_acceptor {
-                                            match tls_acceptor.accept(tcp_stream).await {
-                                                Ok(tls_stream) => Either::Left(http.serve_connection(
-                                                    TokioIo::new(tls_stream),
-                                                    TowerToHyperService::new(svc),
-                                                )),
-                                                Err(err) => {
-                                                    error!(?err, "Failed to accept tls stream");
-                                                    return;
+                                        let _connection_permit = connection_permit;
+                                        let connection_fut = async move {
+                                            let serve_connection = if let Some(tls_acceptor) = maybe_tls_acceptor {
+                                                let tls_accept_result = if let Some(tls_handshake_timeout) = tls_handshake_timeout {
+                                                    match timeout(tls_handshake_timeout, tls_acceptor.accept(tcp_stream)).await {
+                                                        Ok(tls_accept_result) => tls_accept_result,
+                                                        Err(_) => {
+                                                            warn!(
+                                                                target: "nativelink::services",
+                                                                ?remote_addr,
+                                                                ?socket_addr,
+                                                                ?tls_handshake_timeout,
+                                                                "Timed out accepting tls stream"
+                                                            );
+                                                            return;
+                                                        }
+                                                    }
+                                                } else {
+                                                    tls_acceptor.accept(tcp_stream).await
+                                                };
+
+                                                match tls_accept_result {
+                                                    Ok(tls_stream) => Either::Left(http.serve_connection(
+                                                        TokioIo::new(tls_stream),
+                                                        TowerToHyperService::new(svc),
+                                                    )),
+                                                    Err(err) => {
+                                                        error!(?err, "Failed to accept tls stream");
+                                                        return;
+                                                    }
                                                 }
+                                            } else {
+                                                Either::Right(http.serve_connection(
+                                                    TokioIo::new(tcp_stream),
+                                                    TowerToHyperService::new(svc),
+                                                ))
+                                            };
+
+                                            let serve_result = if let Some(connection_timeout) = connection_timeout {
+                                                match timeout(connection_timeout, serve_connection).await {
+                                                    Ok(serve_result) => serve_result,
+                                                    Err(_) => {
+                                                        warn!(
+                                                            target: "nativelink::services",
+                                                            ?remote_addr,
+                                                            ?socket_addr,
+                                                            ?connection_timeout,
+                                                            "Timed out running service connection"
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                            } else {
+                                                serve_connection.await
+                                            };
+
+                                            if let Err(err) = serve_result {
+                                                error!(
+                                                    target: "nativelink::services",
+                                                    ?err,
+                                                    "Failed running service"
+                                                );
                                             }
-                                        } else {
-                                            Either::Right(http.serve_connection(
-                                                TokioIo::new(tcp_stream),
-                                                TowerToHyperService::new(svc),
-                                            ))
                                         };
 
-                                        if let Err(err) = serve_connection.await {
-                                            error!(
-                                                target: "nativelink::services",
-                                                ?err,
-                                                "Failed running service"
-                                            );
+                                        select! {
+                                            biased;
+                                            shutdown_result = connection_shutdown_rx.recv() => {
+                                                if let Err(err) = shutdown_result {
+                                                    warn!(?err, "Connection shutdown channel closed");
+                                                }
+                                                info!(
+                                                    target: "nativelink::services",
+                                                    ?remote_addr,
+                                                    ?socket_addr,
+                                                    "Closing service connection for shutdown"
+                                                );
+                                            },
+                                            () = connection_fut => {},
                                         }
                                     }),
                                     target: "nativelink::services",
@@ -648,7 +771,7 @@ async fn inner_main(
                     },
                 }
             }
-            // Unreachable
+            Ok(())
         }));
     }
 
