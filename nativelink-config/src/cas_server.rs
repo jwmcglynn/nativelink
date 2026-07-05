@@ -455,6 +455,32 @@ pub struct TlsConfig {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct HttpServerConfig {
+    /// Maximum number of concurrently open accepted connections for this
+    /// listener. New connections are dropped while the limit is reached.
+    /// Default: 2048.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub max_open_connections: Option<u32>,
+
+    /// Maximum time to allow a TLS handshake to complete before closing the
+    /// connection. Default: 10 seconds.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub experimental_tls_handshake_timeout: Option<u32>,
+
+    /// Maximum lifetime of an accepted connection before closing it. If unset,
+    /// accepted connections are not closed just because of age. Note: This is
+    /// in seconds.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub experimental_connection_timeout: Option<u32>,
+
     /// Interval to send keep-alive pings via HTTP2.
     /// Note: This is in seconds.
     #[serde(
