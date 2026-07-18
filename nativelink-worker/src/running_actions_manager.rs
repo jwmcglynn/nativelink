@@ -75,7 +75,7 @@ use scopeguard::{ScopeGuard, guard};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process;
-use tokio::sync::{Notify, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, oneshot, watch};
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReadDirStream;
 use tonic::Request;
@@ -285,9 +285,63 @@ fn persistent_worker_request_arguments(argv: &[String]) -> Vec<String> {
 /// overhead.
 const DOWNLOAD_TO_DIRECTORY_CONCURRENCY: usize = 64;
 
+#[derive(Clone, Debug)]
+struct InputMaterializationLimiter {
+    semaphore: Arc<Semaphore>,
+}
+
+impl InputMaterializationLimiter {
+    fn new(max_concurrency: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrency)),
+        }
+    }
+
+    async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Error> {
+        Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|_| make_err!(Code::Internal, "Input materialization limiter was closed"))
+    }
+}
+
+#[cfg(test)]
+mod input_materialization_limiter_tests {
+    use std::task::Poll;
+
+    use nativelink_macro::nativelink_test;
+
+    use super::*;
+
+    #[nativelink_test]
+    async fn bounds_filesystem_work_across_concurrent_actions() -> Result<(), Error> {
+        let limiter = InputMaterializationLimiter::new(2);
+        let action_one_permit = limiter.clone().acquire().await?;
+        let action_two_permit = limiter.clone().acquire().await?;
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+
+        let action_three_limiter = limiter.clone();
+        let action_three_permit = action_three_limiter.acquire();
+        tokio::pin!(action_three_permit);
+        assert!(matches!(
+            futures::poll!(action_three_permit.as_mut()),
+            Poll::Pending
+        ));
+
+        drop(action_one_permit);
+        let action_three_permit = action_three_permit.await?;
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+
+        drop(action_two_permit);
+        drop(action_three_permit);
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+        Ok(())
+    }
+}
+
 /// Aggressively download the digests of files and make a local folder from it. This function
-/// gates each directory level to at most `DOWNLOAD_TO_DIRECTORY_CONCURRENCY`
-/// concurrent in-flight materialization futures.
+/// gates the full materialization to at most `DOWNLOAD_TO_DIRECTORY_CONCURRENCY`
+/// concurrent filesystem operations.
 /// We require the `FilesystemStore` to be the `fast` store of `FastSlowStore`. This is for
 /// efficiency reasons. We will request the `FastSlowStore` to populate the entry then we will
 /// assume the `FilesystemStore` has the file available immediately after and hardlink the file
@@ -301,10 +355,29 @@ pub fn download_to_directory<'a>(
     digest: &'a DigestInfo,
     current_directory: &'a str,
 ) -> BoxFuture<'a, Result<(), Error>> {
+    download_to_directory_with_limiter(
+        cas_store,
+        filesystem_store,
+        digest,
+        current_directory,
+        InputMaterializationLimiter::new(DOWNLOAD_TO_DIRECTORY_CONCURRENCY),
+    )
+}
+
+fn download_to_directory_with_limiter<'a>(
+    cas_store: &'a FastSlowStore,
+    filesystem_store: Pin<&'a FilesystemStore>,
+    digest: &'a DigestInfo,
+    current_directory: &'a str,
+    materialization_limiter: InputMaterializationLimiter,
+) -> BoxFuture<'a, Result<(), Error>> {
     async move {
-        let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
-            .await
-            .err_tip(|| "Converting digest to Directory")?;
+        let directory = {
+            let _permit = materialization_limiter.acquire().await?;
+            get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
+                .await
+                .err_tip(|| "Converting digest to Directory")?
+        };
         let mut futures = Vec::new();
 
         for file in directory.files {
@@ -319,8 +392,11 @@ pub fn download_to_directory<'a>(
                 Some(properties) => (properties.mtime, properties.unix_mode),
                 None => (None, None),
             };
+            let materialization_limiter = materialization_limiter.clone();
             futures.push(
-                cas_store
+                async move {
+                    let _permit = materialization_limiter.acquire().await?;
+                    cas_store
                     .populate_fast_store(digest.into())
                     .and_then(move |()| async move {
                         if is_zero_digest(digest) {
@@ -455,8 +531,10 @@ pub fn download_to_directory<'a>(
                         }
                         Ok(())
                     })
-                    .map_err(move |e| e.append(format!("for digest {digest}")))
-                    .boxed(),
+                    .await
+                }
+                .map_err(move |e| e.append(format!("for digest {digest}")))
+                .boxed(),
             );
         }
 
@@ -467,16 +545,21 @@ pub fn download_to_directory<'a>(
                 .try_into()
                 .err_tip(|| "In Directory::file::digest")?;
             let new_directory_path = format!("{}/{}", current_directory, directory.name);
+            let materialization_limiter = materialization_limiter.clone();
             futures.push(
                 async move {
-                    fs::create_dir(&new_directory_path)
-                        .await
-                        .err_tip(|| format!("Could not create directory {new_directory_path}"))?;
-                    download_to_directory(
+                    {
+                        let _permit = materialization_limiter.acquire().await?;
+                        fs::create_dir(&new_directory_path).await.err_tip(|| {
+                            format!("Could not create directory {new_directory_path}")
+                        })?;
+                    }
+                    download_to_directory_with_limiter(
                         cas_store,
                         filesystem_store,
                         &digest,
                         &new_directory_path,
+                        materialization_limiter,
                     )
                     .await
                     .err_tip(|| format!("in download_to_directory : {new_directory_path}"))?;
@@ -489,8 +572,10 @@ pub fn download_to_directory<'a>(
         #[cfg(target_family = "unix")]
         for symlink_node in directory.symlinks {
             let dest = format!("{}/{}", current_directory, symlink_node.name);
+            let materialization_limiter = materialization_limiter.clone();
             futures.push(
                 async move {
+                    let _permit = materialization_limiter.acquire().await?;
                     fs::symlink(&symlink_node.target, &dest).await.err_tip(|| {
                         format!(
                             "Could not create symlink {} -> {}",
@@ -535,6 +620,27 @@ pub async fn prepare_action_inputs(
     filesystem_store: Pin<&FilesystemStore>,
     digest: &DigestInfo,
     work_directory: &str,
+) -> Result<(), Error> {
+    let materialization_limiter =
+        InputMaterializationLimiter::new(DOWNLOAD_TO_DIRECTORY_CONCURRENCY);
+    prepare_action_inputs_with_limiter(
+        directory_cache,
+        cas_store,
+        filesystem_store,
+        digest,
+        work_directory,
+        &materialization_limiter,
+    )
+    .await
+}
+
+async fn prepare_action_inputs_with_limiter(
+    directory_cache: &Option<Arc<crate::directory_cache::DirectoryCache>>,
+    cas_store: &FastSlowStore,
+    filesystem_store: Pin<&FilesystemStore>,
+    digest: &DigestInfo,
+    work_directory: &str,
+    materialization_limiter: &InputMaterializationLimiter,
 ) -> Result<(), Error> {
     // Try cache first if available
     if let Some(cache) = directory_cache {
@@ -586,7 +692,14 @@ pub async fn prepare_action_inputs(
     }
 
     // Traditional path (cache disabled or failed)
-    download_to_directory(cas_store, filesystem_store, digest, work_directory).await
+    download_to_directory_with_limiter(
+        cas_store,
+        filesystem_store,
+        digest,
+        work_directory,
+        materialization_limiter.clone(),
+    )
+    .await
 }
 
 #[cfg(target_family = "windows")]
@@ -1122,12 +1235,13 @@ impl RunningActionImpl {
                 // Use directory cache if available for better performance.
                 self.metrics()
                     .download_to_directory
-                    .wrap(prepare_action_inputs(
+                    .wrap(prepare_action_inputs_with_limiter(
                         &self.running_actions_manager.directory_cache,
                         &self.running_actions_manager.cas_store,
                         filesystem_store_pin,
                         &self.action_info.input_root_digest,
                         &self.work_directory,
+                        &self.running_actions_manager.input_materialization_limiter,
                     ))
                     .await
             })
@@ -2613,6 +2727,8 @@ pub struct RunningActionsManagerImpl {
     /// Optional directory cache for improving performance by caching reconstructed
     /// input directories and using hardlinks.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    /// Bounds input-tree filesystem operations across every concurrent action.
+    input_materialization_limiter: InputMaterializationLimiter,
     persistent_worker_pool: PersistentWorkerPool,
 }
 
@@ -2658,6 +2774,9 @@ impl RunningActionsManagerImpl {
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
+            input_materialization_limiter: InputMaterializationLimiter::new(
+                DOWNLOAD_TO_DIRECTORY_CONCURRENCY,
+            ),
             persistent_worker_pool: PersistentWorkerPool::default(),
             #[cfg(target_os = "linux")]
             use_namespaces: args.use_namespaces,
