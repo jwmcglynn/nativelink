@@ -275,15 +275,17 @@ fn persistent_worker_request_arguments(argv: &[String]) -> Vec<String> {
         .cloned()
         .collect()
 }
-/// Maximum number of file-materialization (hardlink) or subdirectory
-/// recursion futures polled concurrently per directory level. Higher values
-/// drown APFS's per-volume metadata lock with `hardlink(2)` syscalls and
-/// regress overall throughput vs lower-contention concurrency.
-///
-/// 64 is well above the inflection point on any modern Linux filesystem,
-/// so this is also a no-op on Linux beyond replacing tokio scheduling
-/// overhead.
+/// Maximum number of futures polled concurrently per directory level. The
+/// shared semaphore below is the actual filesystem-concurrency bound; this
+/// larger value only limits the number of ready tasks retained by each walk.
 const DOWNLOAD_TO_DIRECTORY_CONCURRENCY: usize = 64;
+
+/// Maximum number of input-tree filesystem operations across every action on
+/// this worker. In particular this bounds directory-cache materializations:
+/// macOS `clonefile(2)` recursively walks directory trees and concurrent
+/// clones of Bazel's deep input roots otherwise contend on APFS metadata locks,
+/// consuming every core in kernel time while reducing build throughput.
+const INPUT_MATERIALIZATION_CONCURRENCY: usize = 2;
 
 #[derive(Clone, Debug)]
 struct InputMaterializationLimiter {
@@ -360,7 +362,7 @@ pub fn download_to_directory<'a>(
         filesystem_store,
         digest,
         current_directory,
-        InputMaterializationLimiter::new(DOWNLOAD_TO_DIRECTORY_CONCURRENCY),
+        InputMaterializationLimiter::new(INPUT_MATERIALIZATION_CONCURRENCY),
     )
 }
 
@@ -622,7 +624,7 @@ pub async fn prepare_action_inputs(
     work_directory: &str,
 ) -> Result<(), Error> {
     let materialization_limiter =
-        InputMaterializationLimiter::new(DOWNLOAD_TO_DIRECTORY_CONCURRENCY);
+        InputMaterializationLimiter::new(INPUT_MATERIALIZATION_CONCURRENCY);
     prepare_action_inputs_with_limiter(
         directory_cache,
         cas_store,
@@ -651,10 +653,18 @@ async fn prepare_action_inputs_with_limiter(
         fs::remove_dir(work_directory)
             .await
             .err_tip(|| format!("Failed to clear pre-created work directory {work_directory}"))?;
-        match cache
-            .get_or_create(*digest, Path::new(work_directory))
-            .await
-        {
+        // A cache hit still performs a recursive `clonefile(2)`/hardlink tree
+        // materialization. The first limiter implementation bounded only the
+        // fallback file-by-file path, leaving this normal hot path unbounded
+        // across actions. Hold a shared permit for the complete cache
+        // operation so both hits and misses observe the same worker-wide cap.
+        let cache_result = {
+            let _permit = materialization_limiter.acquire().await?;
+            cache
+                .get_or_create(*digest, Path::new(work_directory))
+                .await
+        };
+        match cache_result {
             Ok(cache_hit) => {
                 // The materialized tree is already usable. The directory
                 // cache locks each entry down with `set_readonly_recursive`,
@@ -2775,7 +2785,7 @@ impl RunningActionsManagerImpl {
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
             input_materialization_limiter: InputMaterializationLimiter::new(
-                DOWNLOAD_TO_DIRECTORY_CONCURRENCY,
+                INPUT_MATERIALIZATION_CONCURRENCY,
             ),
             persistent_worker_pool: PersistentWorkerPool::default(),
             #[cfg(target_os = "linux")]
