@@ -1091,6 +1091,23 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .await
     }
 
+    /// Non-unix has no separate executable variant, but callers use the same
+    /// handler API so the primary FileEntry remains pinned through their
+    /// filesystem operation on every platform.
+    #[cfg(not(unix))]
+    pub async fn with_executable_hardlink_source<
+        T,
+        Fut: Future<Output = Result<T, Error>> + Send,
+        F: FnOnce(OsString) -> Fut + Send,
+    >(
+        &self,
+        digest: &DigestInfo,
+        handler: F,
+    ) -> Result<T, Error> {
+        let file_entry = self.get_file_entry_for_digest(digest).await?;
+        file_entry.get_file_path_locked(handler).await
+    }
+
     /// Materializes the 0o555 executable variant for `digest`. Must be called
     /// under the per-digest single-flight guard.
     #[cfg(unix)]
