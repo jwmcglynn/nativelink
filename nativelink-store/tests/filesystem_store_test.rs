@@ -1743,7 +1743,7 @@ async fn executable_variant_remains_pinned_through_materialization_handler() -> 
     let handler_task = tokio::spawn(async move {
         handler_store
             .with_executable_hardlink_source(&digest1, move |path| async move {
-                entered_tx.send(()).map_err(|_| {
+                entered_tx.send(()).map_err(|()| {
                     make_err!(Code::Internal, "Could not signal executable handler entry")
                 })?;
                 release_rx.await.map_err(|_| {
@@ -1770,7 +1770,7 @@ async fn executable_variant_remains_pinned_through_materialization_handler() -> 
 
     release_tx
         .send(())
-        .map_err(|_| make_err!(Code::Internal, "Executable handler finished before release"))?;
+        .map_err(|()| make_err!(Code::Internal, "Executable handler finished before release"))?;
     handler_task
         .await
         .map_err(|err| make_err!(Code::Internal, "Executable handler task failed: {err:?}"))??;
