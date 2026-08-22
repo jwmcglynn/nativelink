@@ -451,7 +451,8 @@ mod input_materialization_limiter_tests {
                 name: "input_materialization_limiter".into(),
                 ..Default::default()
             },
-        )?;
+        )
+        .expect("limiter metrics should publish");
         assert!(matches!(published, MetricPublishKnownKindData::Component));
         assert!(logs_contain("in_flight_tasks"));
         assert!(logs_contain("peak_in_flight_tasks"));
@@ -675,7 +676,7 @@ fn download_to_directory_with_limiter<'a>(
                     }
                     .await
                 }
-                .map_err(move |e| e.append(format!("for digest {digest}")))
+                .map_err(move |e: Error| e.append(format!("for digest {digest}")))
                 .boxed(),
             );
         }

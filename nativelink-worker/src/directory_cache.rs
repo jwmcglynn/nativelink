@@ -945,11 +945,8 @@ mod tests {
         let limiter = InputMaterializationLimiter::new(1);
         let held_permit = limiter.acquire().await?;
 
-        let blocked = cache.get_or_create_with_limiter(
-            dir_digest,
-            &temp_dir.path().join("blocked"),
-            &limiter,
-        );
+        let blocked_dest = temp_dir.path().join("blocked");
+        let blocked = cache.get_or_create_with_limiter(dir_digest, &blocked_dest, &limiter);
         assert!(
             tokio::time::timeout(core::time::Duration::from_millis(25), blocked)
                 .await
