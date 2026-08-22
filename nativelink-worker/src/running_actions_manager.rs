@@ -639,7 +639,7 @@ fn download_to_directory_with_limiter<'a>(
                                         "Failed to launch spawn_blocking private copy in download_to_directory"
                                     })?
                                 })
-                                .await??;
+                                .await?;
                         } else {
                             // Hot path: hardlink only — no writable fd is ever
                             // opened for the materialized inode, so a concurrent

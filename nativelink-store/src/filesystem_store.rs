@@ -836,7 +836,6 @@ impl RemoveItemCallback for ExecutableVariantRemover {
             let StoreKey::Digest(digest) = store_key else {
                 return;
             };
-            let digest = *digest;
             let lock = executable_lock_for_digest(&self.executable_locks, digest);
             let guard = lock.lock().await;
             let variant_path = format!(
@@ -1128,9 +1127,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                     }
                 )
                 .await
+                .err_tip(|| "executable-variant spawn_blocking join failed")?
             })
-            .await
-            .err_tip(|| "executable-variant spawn_blocking join failed")?
+            .await?;
+        Ok(())
     }
 
     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
