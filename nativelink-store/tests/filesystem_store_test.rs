@@ -47,7 +47,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, Take};
-use tokio::sync::{Barrier, Semaphore};
+use tokio::sync::{Barrier, Semaphore, oneshot};
 use tokio::time::sleep;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReadDirStream;
@@ -1709,6 +1709,77 @@ async fn evicting_digest_deletes_its_executable_variant() -> Result<(), Error> {
         Code::NotFound,
         "Expected the executable variant to be gone, got: {err:?}"
     );
+
+    Ok(())
+}
+
+/// Eviction and action materialization must share the per-digest executable
+/// lock. Otherwise eviction can delete the `.exec` source after a caller
+/// resolves its path but before the caller creates the action hardlink.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn executable_variant_remains_pinned_through_materialization_handler() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+    let digest1 = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let digest2 = DigestInfo::try_new(HASH2, VALUE2.len())?;
+
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path,
+        eviction_policy: Some(EvictionPolicy {
+            max_count: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+    store.update_oneshot(digest1, VALUE1.into()).await?;
+
+    let variant_path = OsString::from(format!("{content_path}.exec/{DIGEST_FOLDER}/{digest1}"));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let handler_store = Arc::clone(&store);
+    let handler_task = tokio::spawn(async move {
+        handler_store
+            .with_executable_hardlink_source(&digest1, move |path| async move {
+                entered_tx.send(()).map_err(|_| {
+                    make_err!(Code::Internal, "Could not signal executable handler entry")
+                })?;
+                release_rx.await.map_err(|_| {
+                    make_err!(Code::Internal, "Executable handler release sender dropped")
+                })?;
+                fs::metadata(path).await?;
+                Ok(())
+            })
+            .await
+    });
+    entered_rx
+        .await
+        .map_err(|_| make_err!(Code::Internal, "Executable handler exited before entering"))?;
+
+    let eviction = store.update_oneshot(digest2, VALUE2.into());
+    tokio::pin!(eviction);
+    assert!(
+        matches!(poll!(eviction.as_mut()), Poll::Pending),
+        "eviction must wait while the executable materialization handler owns the lock"
+    );
+    fs::metadata(&variant_path)
+        .await
+        .err_tip(|| "Executable variant disappeared while handler held its lock")?;
+
+    release_tx
+        .send(())
+        .map_err(|_| make_err!(Code::Internal, "Executable handler finished before release"))?;
+    handler_task
+        .await
+        .map_err(|err| make_err!(Code::Internal, "Executable handler task failed: {err:?}"))??;
+    eviction.await?;
+
+    let err = fs::metadata(&variant_path)
+        .await
+        .expect_err("Executable variant must be removed after the handler releases it");
+    assert_eq!(err.code, Code::NotFound);
 
     Ok(())
 }
