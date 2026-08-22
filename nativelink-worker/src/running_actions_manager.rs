@@ -386,11 +386,16 @@ impl InputMaterializationLimiter {
             metrics: Arc::clone(&self.metrics),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn permit_wait_calls(&self) -> u64 {
+        self.metrics.permit_waits.calls.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
 mod input_materialization_limiter_tests {
-    use std::task::Poll;
+    use core::task::Poll;
 
     use nativelink_macro::nativelink_test;
 
@@ -541,6 +546,18 @@ fn download_to_directory_with_limiter<'a>(
                         .await
                         .err_tip(|| format!("Populating fast store for digest {digest}"))?;
                     let _permit = materialization_limiter.acquire().await?;
+                    // The warm population above overlaps remote reads across
+                    // files, but the blob can be evicted while this task waits
+                    // for a worker-wide materialization permit. Revalidate it
+                    // under the permit before resolving a FilesystemStore path.
+                    cas_store
+                        .populate_fast_store(digest.into())
+                        .await
+                        .err_tip(|| {
+                            format!(
+                                "Repopulating fast store under materialization permit for digest {digest}"
+                            )
+                        })?;
                     async move {
                         if is_zero_digest(digest) {
                             // Zero-digest files are never persisted by the

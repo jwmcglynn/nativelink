@@ -190,13 +190,12 @@ impl DirectoryCache {
         // `ref_count` bump is what makes releasing the lock safe: eviction
         // skips any entry with `ref_count > 0`, so the cache path cannot be
         // deleted out from under the unlocked materialization.
+        let permit = limiter.acquire().await?;
         if let Some(cache_path) = self.acquire_entry(&digest).await {
             debug!(?digest, ?cache_path, "Directory cache HIT");
-            let result = {
-                let _permit = limiter.acquire().await?;
-                hardlink_directory_tree(&cache_path, dest_path).await
-            };
+            let result = hardlink_directory_tree(&cache_path, dest_path).await;
             self.release_entry(&digest).await;
+            drop(permit);
             match result {
                 Ok(method) => {
                     self.record_clone_method(method);
@@ -211,6 +210,10 @@ impl DirectoryCache {
                     // Fall through to reconstruction.
                 }
             }
+        } else {
+            // A cache miss does no filesystem materialization on this path.
+            // Release the permit before waiting on the per-digest constructor.
+            drop(permit);
         }
 
         debug!(?digest, "Directory cache MISS");
@@ -250,13 +253,16 @@ impl DirectoryCache {
         dest_path: &Path,
         limiter: &InputMaterializationLimiter,
     ) -> Result<bool, Error> {
+        // Acquire before pinning a cache entry. A task canceled while queued
+        // therefore cannot leak `ref_count` and permanently disable eviction.
+        // On a miss, keep this permit through construction, insertion, and the
+        // destination hardlink so the newly inserted pin never spans a queue.
+        let _permit = limiter.acquire().await?;
+
         // Re-check: another task may have just constructed this digest while
         // we waited on the construction lock.
         if let Some(cache_path) = self.acquire_entry(&digest).await {
-            let result = {
-                let _permit = limiter.acquire().await?;
-                hardlink_directory_tree(&cache_path, dest_path).await
-            };
+            let result = hardlink_directory_tree(&cache_path, dest_path).await;
             self.release_entry(&digest).await;
             match result {
                 Ok(method) => {
@@ -270,7 +276,6 @@ impl DirectoryCache {
                         "Failed to hardlink after construction"
                     );
                     // Construct directly at dest_path as a last resort.
-                    let _permit = limiter.acquire().await?;
                     self.construct_directory(digest, dest_path).await?;
                     return Ok(false);
                 }
@@ -289,10 +294,7 @@ impl DirectoryCache {
         // with the CAS and every other in-flight action that hardlinked the
         // same blob — the inode-corruption bug PR #2347 fixed.
         let cache_path = self.get_cache_path(&digest);
-        let size = {
-            let _permit = limiter.acquire().await?;
-            self.construct_directory(digest, &cache_path).await?
-        };
+        let size = self.construct_directory(digest, &cache_path).await?;
 
         // Insert into the cache. Only the in-memory map mutation runs under
         // the write lock: `evict_if_needed` selects victims and removes them
@@ -323,7 +325,6 @@ impl DirectoryCache {
 
         // Hardlink to destination (unlocked). The entry is pinned
         // (`ref_count == 1`) so it cannot be evicted from under this hardlink.
-        let _permit = limiter.acquire().await?;
         let result = hardlink_directory_tree(&cache_path, dest_path).await;
         self.release_entry(&digest).await;
         let method = result.err_tip(|| "Failed to hardlink newly cached directory")?;
@@ -942,27 +943,46 @@ mod tests {
             store,
         )
         .await?;
+
+        let seed_dest = temp_dir.path().join("seed");
+        let hit = cache.get_or_create(dir_digest, &seed_dest).await?;
+        assert!(!hit, "first access must populate the directory cache");
+
         let limiter = InputMaterializationLimiter::new(1);
         let held_permit = limiter.acquire().await?;
 
         let blocked_dest = temp_dir.path().join("blocked");
-        let blocked = cache.get_or_create_with_limiter(dir_digest, &blocked_dest, &limiter);
+        let mut blocked =
+            Box::pin(cache.get_or_create_with_limiter(dir_digest, &blocked_dest, &limiter));
         assert!(
-            tokio::time::timeout(core::time::Duration::from_millis(25), blocked)
-                .await
-                .is_err(),
-            "cache materialization must wait while the configured permit is held"
+            matches!(futures::poll!(blocked.as_mut()), core::task::Poll::Pending),
+            "a populated cache hit must wait on the configured permit"
         );
+        assert_eq!(
+            limiter.permit_wait_calls(),
+            1,
+            "the pending cache hit must be queued on the shared limiter"
+        );
+        assert_eq!(
+            cache.stats().await.in_use_entries,
+            0,
+            "a task waiting for a permit must not pin the cached entry"
+        );
+
+        // Cancellation while queued must leave the cache entry unpinned.
+        drop(blocked);
+        assert_eq!(cache.stats().await.in_use_entries, 0);
 
         drop(held_permit);
         let hit = cache
             .get_or_create_with_limiter(dir_digest, &temp_dir.path().join("released"), &limiter)
             .await?;
         assert!(
-            !hit,
-            "canceled first construction must not create a cache entry"
+            hit,
+            "the populated cache entry must remain usable after a queued task is canceled"
         );
         assert!(temp_dir.path().join("released/test.txt").exists());
+        assert_eq!(cache.stats().await.in_use_entries, 0);
         Ok(())
     }
 
