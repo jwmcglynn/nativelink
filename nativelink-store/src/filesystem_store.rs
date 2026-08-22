@@ -97,6 +97,31 @@ fn forget_executable_lock(locks: &ExecutableLocks, digest: &DigestInfo, lock: &A
     }
 }
 
+#[cfg(unix)]
+struct ExecutableLockRegistration {
+    locks: ExecutableLocks,
+    digest: DigestInfo,
+    lock: Arc<Mutex<()>>,
+}
+
+#[cfg(unix)]
+impl ExecutableLockRegistration {
+    fn new(locks: &ExecutableLocks, digest: DigestInfo, lock: &Arc<Mutex<()>>) -> Self {
+        Self {
+            locks: Arc::clone(locks),
+            digest,
+            lock: Arc::clone(lock),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ExecutableLockRegistration {
+    fn drop(&mut self) {
+        forget_executable_lock(&self.locks, &self.digest, &self.lock);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum FileType {
     Digest,
@@ -837,6 +862,8 @@ impl RemoveItemCallback for ExecutableVariantRemover {
                 return;
             };
             let lock = executable_lock_for_digest(&self.executable_locks, digest);
+            let _registration =
+                ExecutableLockRegistration::new(&self.executable_locks, digest, &lock);
             let guard = lock.lock().await;
             let variant_path = format!(
                 "{}{EXECUTABLE_DIR_SUFFIX}/{DIGEST_FOLDER}/{digest}",
@@ -856,7 +883,6 @@ impl RemoveItemCallback for ExecutableVariantRemover {
                 ),
             }
             drop(guard);
-            forget_executable_lock(&self.executable_locks, &digest, &lock);
         })
     }
 }
@@ -1034,6 +1060,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     ) -> Result<T, Error> {
         let variant_path = self.executable_variant_path(digest);
         let lock = executable_lock_for_digest(&self.executable_locks, *digest);
+        let _registration = ExecutableLockRegistration::new(&self.executable_locks, *digest, &lock);
         let guard = lock.lock().await;
 
         // Re-check: another task may have constructed it while we waited.
@@ -1048,7 +1075,6 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         .await;
 
         drop(guard);
-        forget_executable_lock(&self.executable_locks, digest, &lock);
         result
     }
 
