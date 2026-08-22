@@ -692,6 +692,7 @@ pub async fn new_local_worker(
             max_upload_timeout,
             timeout_handled_externally: config.timeout_handled_externally,
             directory_cache,
+            input_materialization_max_concurrency: config.input_materialization_max_concurrency,
             #[cfg(target_os = "linux")]
             use_namespaces,
         })?);

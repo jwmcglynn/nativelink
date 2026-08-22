@@ -583,6 +583,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -707,6 +708,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -833,6 +835,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1015,6 +1018,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1198,6 +1202,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1450,6 +1455,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1600,6 +1606,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1741,6 +1748,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1877,6 +1885,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2081,6 +2090,7 @@ exit 0
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2258,6 +2268,7 @@ exit 0
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2429,6 +2440,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2517,6 +2529,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2593,6 +2606,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2676,6 +2690,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2780,6 +2795,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2828,6 +2844,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2897,6 +2914,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -3017,6 +3035,7 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    input_materialization_max_concurrency: 0,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
                 },
@@ -3105,6 +3124,7 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    input_materialization_max_concurrency: 0,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
                 },
@@ -3193,6 +3213,7 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    input_materialization_max_concurrency: 0,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
                 },
@@ -3278,6 +3299,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -3427,6 +3449,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -3593,6 +3616,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -3694,6 +3718,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -3899,6 +3924,7 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -3996,6 +4022,7 @@ done
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -4177,6 +4204,7 @@ done
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -4298,6 +4326,7 @@ done
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -4440,6 +4469,7 @@ done
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -4549,6 +4579,7 @@ done
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -4689,6 +4720,7 @@ done
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -4860,6 +4892,7 @@ done
                 max_upload_timeout: Duration::MAX,
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_materialization_max_concurrency: 0,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },

@@ -16,7 +16,7 @@ use core::cmp::min;
 use core::convert::Into;
 use core::fmt::Debug;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::vec_deque::VecDeque;
@@ -280,30 +280,102 @@ fn persistent_worker_request_arguments(argv: &[String]) -> Vec<String> {
 /// larger value only limits the number of ready tasks retained by each walk.
 const DOWNLOAD_TO_DIRECTORY_CONCURRENCY: usize = 64;
 
-/// Maximum number of input-tree filesystem operations across every action on
-/// this worker. In particular this bounds directory-cache materializations:
-/// macOS `clonefile(2)` recursively walks directory trees and concurrent
-/// clones of Bazel's deep input roots otherwise contend on APFS metadata locks,
-/// consuming every core in kernel time while reducing build throughput.
-const INPUT_MATERIALIZATION_CONCURRENCY: usize = 2;
+/// Default worker-wide input-materialization bound. Zero preserves the legacy
+/// behavior: no shared bound across actions. The per-directory fanout limit
+/// above still applies.
+const DEFAULT_INPUT_MATERIALIZATION_MAX_CONCURRENCY: usize = 0;
+
+#[derive(Debug, Default, MetricsComponent)]
+struct InputMaterializationLimiterMetrics {
+    active_operations: AtomicU64,
+    #[metric(help = "Highest number of concurrent input-materialization filesystem operations.")]
+    peak_active_operations: AtomicU64,
+    #[metric(help = "Number and total duration of waits for an input-materialization permit.")]
+    permit_waits: AsyncCounterWrapper,
+    #[metric(help = "Total number of acquired input-materialization permits.")]
+    permit_acquisitions: CounterWithTime,
+}
+
+#[derive(Debug)]
+struct InputMaterializationPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    metrics: Arc<InputMaterializationLimiterMetrics>,
+}
+
+impl Drop for InputMaterializationPermit {
+    fn drop(&mut self) {
+        self.metrics
+            .active_operations
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Debug)]
 struct InputMaterializationLimiter {
     semaphore: Arc<Semaphore>,
+    metrics: Arc<InputMaterializationLimiterMetrics>,
 }
 
 impl InputMaterializationLimiter {
     fn new(max_concurrency: usize) -> Self {
+        Self::new_with_metrics(max_concurrency, Arc::default())
+    }
+
+    fn new_with_metrics(
+        configured_max_concurrency: usize,
+        metrics: Arc<InputMaterializationLimiterMetrics>,
+    ) -> Self {
+        let max_concurrency = if configured_max_concurrency == 0 {
+            Semaphore::MAX_PERMITS
+        } else {
+            configured_max_concurrency.min(Semaphore::MAX_PERMITS)
+        };
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
+            metrics,
         }
     }
 
-    async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Error> {
-        Arc::clone(&self.semaphore)
-            .acquire_owned()
-            .await
-            .map_err(|_| make_err!(Code::Internal, "Input materialization limiter was closed"))
+    async fn acquire(&self) -> Result<InputMaterializationPermit, Error> {
+        let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                self.metrics
+                    .permit_waits
+                    .wrap(async {
+                        Arc::clone(&self.semaphore)
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| {
+                                make_err!(
+                                    Code::Internal,
+                                    "Input materialization limiter was closed"
+                                )
+                            })
+                    })
+                    .await?
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(make_err!(
+                    Code::Internal,
+                    "Input materialization limiter was closed"
+                ));
+            }
+        };
+
+        self.metrics.permit_acquisitions.inc();
+        let active_operations = self
+            .metrics
+            .active_operations
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        self.metrics
+            .peak_active_operations
+            .fetch_max(active_operations, Ordering::AcqRel);
+        Ok(InputMaterializationPermit {
+            _permit: permit,
+            metrics: Arc::clone(&self.metrics),
+        })
     }
 }
 
@@ -337,6 +409,44 @@ mod input_materialization_limiter_tests {
         drop(action_two_permit);
         drop(action_three_permit);
         assert_eq!(limiter.semaphore.available_permits(), 2);
+        assert_eq!(
+            limiter.metrics.permit_waits.calls.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            limiter
+                .metrics
+                .permit_acquisitions
+                .counter
+                .load(Ordering::Acquire),
+            3
+        );
+        assert_eq!(
+            limiter
+                .metrics
+                .peak_active_operations
+                .load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(limiter.metrics.active_operations.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn zero_preserves_unbounded_worker_behavior() -> Result<(), Error> {
+        let limiter = InputMaterializationLimiter::new(0);
+        assert_eq!(
+            limiter.semaphore.available_permits(),
+            Semaphore::MAX_PERMITS
+        );
+        let _permits = futures::future::try_join_all(
+            (0..DOWNLOAD_TO_DIRECTORY_CONCURRENCY * 2).map(|_| limiter.clone().acquire()),
+        )
+        .await?;
+        assert_eq!(
+            limiter.metrics.permit_waits.calls.load(Ordering::Acquire),
+            0
+        );
         Ok(())
     }
 }
@@ -362,7 +472,7 @@ pub fn download_to_directory<'a>(
         filesystem_store,
         digest,
         current_directory,
-        InputMaterializationLimiter::new(INPUT_MATERIALIZATION_CONCURRENCY),
+        InputMaterializationLimiter::new(DEFAULT_INPUT_MATERIALIZATION_MAX_CONCURRENCY),
     )
 }
 
@@ -624,7 +734,7 @@ pub async fn prepare_action_inputs(
     work_directory: &str,
 ) -> Result<(), Error> {
     let materialization_limiter =
-        InputMaterializationLimiter::new(INPUT_MATERIALIZATION_CONCURRENCY);
+        InputMaterializationLimiter::new(DEFAULT_INPUT_MATERIALIZATION_MAX_CONCURRENCY);
     prepare_action_inputs_with_limiter(
         directory_cache,
         cas_store,
@@ -2686,6 +2796,7 @@ pub struct RunningActionsManagerArgs<'a> {
     pub max_upload_timeout: Duration,
     pub timeout_handled_externally: bool,
     pub directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    pub input_materialization_max_concurrency: usize,
     #[cfg(target_os = "linux")]
     pub use_namespaces: UseNamespaces,
 }
@@ -2763,6 +2874,15 @@ impl RunningActionsManagerImpl {
             .get_arc()
             .err_tip(|| "FilesystemStore's internal Arc was lost")?;
         let (action_done_tx, _) = watch::channel(());
+        let metrics = Arc::new(Metrics::default());
+        let input_materialization_limiter = InputMaterializationLimiter::new_with_metrics(
+            args.input_materialization_max_concurrency,
+            Arc::clone(&metrics.input_materialization_limiter),
+        );
+        info!(
+            input_materialization_max_concurrency = args.input_materialization_max_concurrency,
+            "Configured worker-wide input-materialization limiter (0 preserves legacy unbounded behavior)"
+        );
         Ok(Self {
             root_action_directory: args.root_action_directory,
             execution_configuration: args.execution_configuration,
@@ -2780,13 +2900,11 @@ impl RunningActionsManagerImpl {
             running_actions: Mutex::new(HashMap::new()),
             action_done_tx,
             callbacks,
-            metrics: Arc::new(Metrics::default()),
+            metrics,
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
-            input_materialization_limiter: InputMaterializationLimiter::new(
-                INPUT_MATERIALIZATION_CONCURRENCY,
-            ),
+            input_materialization_limiter,
             persistent_worker_pool: PersistentWorkerPool::default(),
             #[cfg(target_os = "linux")]
             use_namespaces: args.use_namespaces,
@@ -3160,6 +3278,8 @@ pub struct Metrics {
     get_proto_command_from_store: AsyncCounterWrapper,
     #[metric(help = "Stats about the download_to_directory command.")]
     download_to_directory: AsyncCounterWrapper,
+    #[metric(help = "Worker-wide input-materialization limiter occupancy and wait statistics.")]
+    input_materialization_limiter: Arc<InputMaterializationLimiterMetrics>,
     #[metric(help = "Stats about the prepare_output_files command.")]
     prepare_output_files: AsyncCounterWrapper,
     #[metric(help = "Stats about the prepare_output_paths command.")]

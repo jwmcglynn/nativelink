@@ -810,6 +810,18 @@ pub struct LocalWorkerConfig {
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_inflight_tasks: u64,
 
+    /// Maximum number of input-tree filesystem operations shared across every
+    /// action on this worker. This bounds hardlink, directory creation, and
+    /// directory-cache materialization pressure independently of
+    /// `max_inflight_tasks`.
+    ///
+    /// A value of 0 preserves the legacy behavior: no worker-wide bound (the
+    /// existing per-directory fanout limit still applies).
+    ///
+    /// Default: 0 (no worker-wide bound)
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub input_materialization_max_concurrency: usize,
+
     /// If timeout is handled in `entrypoint` or another wrapper script.
     /// If set to true `NativeLink` will not honor the timeout the action requested
     /// and instead will always force kill the action after `max_action_timeout`
