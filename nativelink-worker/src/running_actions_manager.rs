@@ -286,10 +286,17 @@ const DOWNLOAD_TO_DIRECTORY_CONCURRENCY: usize = 64;
 const DEFAULT_INPUT_MATERIALIZATION_MAX_CONCURRENCY: usize = 0;
 
 #[derive(Debug, Default, MetricsComponent)]
-struct InputMaterializationLimiterMetrics {
-    active_operations: AtomicU64,
-    #[metric(help = "Highest number of concurrent input-materialization filesystem operations.")]
-    peak_active_operations: AtomicU64,
+pub(crate) struct InputMaterializationLimiterMetrics {
+    #[metric(help = "Current number of input-materialization filesystem tasks holding permits.")]
+    in_flight_tasks: AtomicU64,
+    #[metric(help = "Highest number of concurrent input-materialization filesystem tasks.")]
+    peak_in_flight_tasks: AtomicU64,
+    #[metric(
+        help = "Configured worker-wide input-materialization concurrency (0 means unbounded)."
+    )]
+    configured_max_concurrency: AtomicU64,
+    #[metric(help = "Effective worker-wide input-materialization concurrency.")]
+    effective_max_concurrency: AtomicU64,
     #[metric(help = "Number and total duration of waits for an input-materialization permit.")]
     permit_waits: AsyncCounterWrapper,
     #[metric(help = "Total number of acquired input-materialization permits.")]
@@ -297,27 +304,25 @@ struct InputMaterializationLimiterMetrics {
 }
 
 #[derive(Debug)]
-struct InputMaterializationPermit {
+pub(crate) struct InputMaterializationPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
     metrics: Arc<InputMaterializationLimiterMetrics>,
 }
 
 impl Drop for InputMaterializationPermit {
     fn drop(&mut self) {
-        self.metrics
-            .active_operations
-            .fetch_sub(1, Ordering::AcqRel);
+        self.metrics.in_flight_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 #[derive(Clone, Debug)]
-struct InputMaterializationLimiter {
+pub(crate) struct InputMaterializationLimiter {
     semaphore: Arc<Semaphore>,
     metrics: Arc<InputMaterializationLimiterMetrics>,
 }
 
 impl InputMaterializationLimiter {
-    fn new(max_concurrency: usize) -> Self {
+    pub(crate) fn new(max_concurrency: usize) -> Self {
         Self::new_with_metrics(max_concurrency, Arc::default())
     }
 
@@ -330,13 +335,21 @@ impl InputMaterializationLimiter {
         } else {
             configured_max_concurrency.min(Semaphore::MAX_PERMITS)
         };
+        metrics.configured_max_concurrency.store(
+            configured_max_concurrency.try_into().unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+        metrics.effective_max_concurrency.store(
+            max_concurrency.try_into().unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
             metrics,
         }
     }
 
-    async fn acquire(&self) -> Result<InputMaterializationPermit, Error> {
+    pub(crate) async fn acquire(&self) -> Result<InputMaterializationPermit, Error> {
         let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
@@ -364,14 +377,10 @@ impl InputMaterializationLimiter {
         };
 
         self.metrics.permit_acquisitions.inc();
-        let active_operations = self
-            .metrics
-            .active_operations
-            .fetch_add(1, Ordering::AcqRel)
-            + 1;
+        let in_flight_tasks = self.metrics.in_flight_tasks.fetch_add(1, Ordering::AcqRel) + 1;
         self.metrics
-            .peak_active_operations
-            .fetch_max(active_operations, Ordering::AcqRel);
+            .peak_in_flight_tasks
+            .fetch_max(in_flight_tasks, Ordering::AcqRel);
         Ok(InputMaterializationPermit {
             _permit: permit,
             metrics: Arc::clone(&self.metrics),
@@ -422,13 +431,33 @@ mod input_materialization_limiter_tests {
             3
         );
         assert_eq!(
-            limiter
-                .metrics
-                .peak_active_operations
-                .load(Ordering::Acquire),
+            limiter.metrics.peak_in_flight_tasks.load(Ordering::Acquire),
             2
         );
-        assert_eq!(limiter.metrics.active_operations.load(Ordering::Acquire), 0);
+        assert_eq!(limiter.metrics.in_flight_tasks.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn publishes_occupancy_and_limit_metrics() -> Result<(), Error> {
+        use nativelink_metric::{MetricFieldData, MetricKind, MetricPublishKnownKindData};
+
+        let limiter = InputMaterializationLimiter::new(2);
+        let permit = limiter.acquire().await?;
+        let published = MetricsComponent::publish(
+            limiter.metrics.as_ref(),
+            MetricKind::Component,
+            MetricFieldData {
+                name: "input_materialization_limiter".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(matches!(published, MetricPublishKnownKindData::Component));
+        assert!(logs_contain("in_flight_tasks"));
+        assert!(logs_contain("peak_in_flight_tasks"));
+        assert!(logs_contain("configured_max_concurrency"));
+        assert!(logs_contain("effective_max_concurrency"));
+        drop(permit);
         Ok(())
     }
 
@@ -452,9 +481,10 @@ mod input_materialization_limiter_tests {
     }
 }
 
-/// Aggressively download the digests of files and make a local folder from it. This function
-/// gates the full materialization to at most `DOWNLOAD_TO_DIRECTORY_CONCURRENCY`
-/// concurrent filesystem operations.
+/// Aggressively download the digests of files and make a local folder from it.
+/// Each directory walk retains at most `DOWNLOAD_TO_DIRECTORY_CONCURRENCY`
+/// ready futures. A worker-configured shared limiter independently bounds
+/// filesystem tasks across concurrent walks and actions.
 /// We require the `FilesystemStore` to be the `fast` store of `FastSlowStore`. This is for
 /// efficiency reasons. We will request the `FastSlowStore` to populate the entry then we will
 /// assume the `FilesystemStore` has the file available immediately after and hardlink the file
@@ -485,12 +515,9 @@ fn download_to_directory_with_limiter<'a>(
     materialization_limiter: InputMaterializationLimiter,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
-        let directory = {
-            let _permit = materialization_limiter.acquire().await?;
-            get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
-                .await
-                .err_tip(|| "Converting digest to Directory")?
-        };
+        let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
+            .await
+            .err_tip(|| "Converting digest to Directory")?;
         let mut futures = Vec::new();
 
         for file in directory.files {
@@ -508,10 +535,12 @@ fn download_to_directory_with_limiter<'a>(
             let materialization_limiter = materialization_limiter.clone();
             futures.push(
                 async move {
-                    let _permit = materialization_limiter.acquire().await?;
                     cas_store
-                    .populate_fast_store(digest.into())
-                    .and_then(move |()| async move {
+                        .populate_fast_store(digest.into())
+                        .await
+                        .err_tip(|| format!("Populating fast store for digest {digest}"))?;
+                    let _permit = materialization_limiter.acquire().await?;
+                    async move {
                         if is_zero_digest(digest) {
                             // Zero-digest files are never persisted by the
                             // FilesystemStore, so materialise them directly in
@@ -643,7 +672,7 @@ fn download_to_directory_with_limiter<'a>(
                             )??;
                         }
                         Ok(())
-                    })
+                    }
                     .await
                 }
                 .map_err(move |e| e.append(format!("for digest {digest}")))
@@ -764,17 +793,12 @@ async fn prepare_action_inputs_with_limiter(
         fs::remove_dir(work_directory)
             .await
             .err_tip(|| format!("Failed to clear pre-created work directory {work_directory}"))?;
-        // A cache hit still performs a recursive `clonefile(2)`/hardlink tree
-        // materialization. The first limiter implementation bounded only the
-        // fallback file-by-file path, leaving this normal hot path unbounded
-        // across actions. Hold a shared permit for the complete cache
-        // operation so both hits and misses observe the same worker-wide cap.
-        let cache_result = {
-            let _permit = materialization_limiter.acquire().await?;
-            cache
-                .get_or_create(*digest, Path::new(work_directory))
-                .await
-        };
+        // DirectoryCache acquires permits only around construction and tree
+        // materialization. Its same-digest single-flight wait remains outside
+        // the limiter so followers cannot consume every permit while idle.
+        let cache_result = cache
+            .get_or_create_with_limiter(*digest, Path::new(work_directory), materialization_limiter)
+            .await;
         match cache_result {
             Ok(cache_hit) => {
                 // The materialized tree is already usable. The directory
@@ -1326,8 +1350,9 @@ impl RunningActionImpl {
     /// * Download any files needed to execute the action
     /// * Build a folder with all files needed to execute the action.
     ///
-    /// This function will aggressively download and spawn potentially thousands of futures. It is
-    /// up to the stores to rate limit if needed.
+    /// This function may discover thousands of inputs. Stores rate-limit CAS
+    /// traffic, while the worker-wide materialization limiter bounds the
+    /// filesystem tasks that create the action tree.
     async fn inner_prepare_action(self: Arc<Self>) -> Result<Arc<Self>, Error> {
         {
             let mut state = self.state.lock();

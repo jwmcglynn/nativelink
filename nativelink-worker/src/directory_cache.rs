@@ -36,6 +36,8 @@ use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, trace, warn};
 
+use crate::running_actions_manager::InputMaterializationLimiter;
+
 /// Configuration for the directory cache
 #[derive(Debug, Clone)]
 pub struct DirectoryCacheConfig {
@@ -165,6 +167,20 @@ impl DirectoryCache {
     /// * `Ok(false)` - Cache miss (directory was constructed)
     /// * `Err` - Error during construction or hardlinking
     pub async fn get_or_create(&self, digest: DigestInfo, dest_path: &Path) -> Result<bool, Error> {
+        let limiter = InputMaterializationLimiter::new(0);
+        self.get_or_create_with_limiter(digest, dest_path, &limiter)
+            .await
+    }
+
+    /// Equivalent to [`Self::get_or_create`], with a worker-wide limiter held
+    /// only while filesystem materialization is actually running. Waiting on
+    /// the per-digest construction lock does not consume a permit.
+    pub(crate) async fn get_or_create_with_limiter(
+        &self,
+        digest: DigestInfo,
+        dest_path: &Path,
+        limiter: &InputMaterializationLimiter,
+    ) -> Result<bool, Error> {
         // Fast path: check if already in cache.
         //
         // The cache write lock is held only long enough to bump `ref_count`
@@ -176,7 +192,10 @@ impl DirectoryCache {
         // deleted out from under the unlocked materialization.
         if let Some(cache_path) = self.acquire_entry(&digest).await {
             debug!(?digest, ?cache_path, "Directory cache HIT");
-            let result = hardlink_directory_tree(&cache_path, dest_path).await;
+            let result = {
+                let _permit = limiter.acquire().await?;
+                hardlink_directory_tree(&cache_path, dest_path).await
+            };
             self.release_entry(&digest).await;
             match result {
                 Ok(method) => {
@@ -215,7 +234,9 @@ impl DirectoryCache {
         // outcome so it cannot grow unbounded. The guard (`_guard`) is still
         // held until the end of this function — `forget_construction_lock`
         // only unmaps the Arc; any waiter already cloned it before blocking.
-        let result = self.construct_and_materialize(digest, dest_path).await;
+        let result = self
+            .construct_and_materialize(digest, dest_path, limiter)
+            .await;
         self.forget_construction_lock(&digest).await;
         result
     }
@@ -227,11 +248,15 @@ impl DirectoryCache {
         &self,
         digest: DigestInfo,
         dest_path: &Path,
+        limiter: &InputMaterializationLimiter,
     ) -> Result<bool, Error> {
         // Re-check: another task may have just constructed this digest while
         // we waited on the construction lock.
         if let Some(cache_path) = self.acquire_entry(&digest).await {
-            let result = hardlink_directory_tree(&cache_path, dest_path).await;
+            let result = {
+                let _permit = limiter.acquire().await?;
+                hardlink_directory_tree(&cache_path, dest_path).await
+            };
             self.release_entry(&digest).await;
             match result {
                 Ok(method) => {
@@ -245,6 +270,7 @@ impl DirectoryCache {
                         "Failed to hardlink after construction"
                     );
                     // Construct directly at dest_path as a last resort.
+                    let _permit = limiter.acquire().await?;
                     self.construct_directory(digest, dest_path).await?;
                     return Ok(false);
                 }
@@ -263,7 +289,10 @@ impl DirectoryCache {
         // with the CAS and every other in-flight action that hardlinked the
         // same blob — the inode-corruption bug PR #2347 fixed.
         let cache_path = self.get_cache_path(&digest);
-        let size = self.construct_directory(digest, &cache_path).await?;
+        let size = {
+            let _permit = limiter.acquire().await?;
+            self.construct_directory(digest, &cache_path).await?
+        };
 
         // Insert into the cache. Only the in-memory map mutation runs under
         // the write lock: `evict_if_needed` selects victims and removes them
@@ -294,6 +323,7 @@ impl DirectoryCache {
 
         // Hardlink to destination (unlocked). The entry is pinned
         // (`ref_count == 1`) so it cannot be evicted from under this hardlink.
+        let _permit = limiter.acquire().await?;
         let result = hardlink_directory_tree(&cache_path, dest_path).await;
         self.release_entry(&digest).await;
         let method = result.err_tip(|| "Failed to hardlink newly cached directory")?;
@@ -895,6 +925,47 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_configured_limiter_bounds_cache_materialization() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store(&temp_dir).await;
+        let cache = DirectoryCache::new(
+            DirectoryCacheConfig {
+                max_entries: 10,
+                max_size_bytes: 1024 * 1024,
+                cache_root,
+            },
+            store,
+        )
+        .await?;
+        let limiter = InputMaterializationLimiter::new(1);
+        let held_permit = limiter.acquire().await?;
+
+        let blocked = cache.get_or_create_with_limiter(
+            dir_digest,
+            &temp_dir.path().join("blocked"),
+            &limiter,
+        );
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_millis(25), blocked)
+                .await
+                .is_err(),
+            "cache materialization must wait while the configured permit is held"
+        );
+
+        drop(held_permit);
+        let hit = cache
+            .get_or_create_with_limiter(dir_digest, &temp_dir.path().join("released"), &limiter)
+            .await?;
+        assert!(
+            !hit,
+            "canceled first construction must not create a cache entry"
+        );
+        assert!(temp_dir.path().join("released/test.txt").exists());
         Ok(())
     }
 
