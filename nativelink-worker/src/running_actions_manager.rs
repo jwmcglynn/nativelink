@@ -439,9 +439,10 @@ mod input_materialization_limiter_tests {
             limiter.semaphore.available_permits(),
             Semaphore::MAX_PERMITS
         );
-        let _permits = futures::future::try_join_all(
-            (0..DOWNLOAD_TO_DIRECTORY_CONCURRENCY * 2).map(|_| limiter.clone().acquire()),
-        )
+        let _permits = try_join_all((0..DOWNLOAD_TO_DIRECTORY_CONCURRENCY * 2).map(|_| {
+            let limiter = limiter.clone();
+            async move { limiter.acquire().await }
+        }))
         .await?;
         assert_eq!(
             limiter.metrics.permit_waits.calls.load(Ordering::Acquire),
