@@ -1566,7 +1566,7 @@ async fn check_health_failed_when_content_path_is_missing() -> Result<(), Error>
     }
 }
 
-/// `get_executable_hardlink_source` must return a private **0o555** inode that
+/// `with_executable_hardlink_source` must provide a private **0o555** inode that
 /// is created exactly once: distinct from the read-only **0o444** CAS blob,
 /// stable across calls (so callers hardlink-many), and leaving the CAS blob's
 /// mode/inode untouched. This is what lets the worker materialize executable
@@ -1603,7 +1603,9 @@ async fn executable_hardlink_source_created_once_and_readonly() -> Result<(), Er
 
     // First call materializes the executable variant: a separate 0o555 inode
     // with identical content.
-    let exec1 = store.get_executable_hardlink_source(&digest).await?;
+    let exec1 = store
+        .with_executable_hardlink_source(&digest, |path| async move { Ok(path) })
+        .await?;
     let exec_meta1 = fs::metadata(&exec1).await?;
     assert_eq!(
         exec_meta1.mode() & 0o777,
@@ -1623,7 +1625,9 @@ async fn executable_hardlink_source_created_once_and_readonly() -> Result<(), Er
 
     // Second call is created-once: same path and same inode (callers hardlink
     // this one inode many times rather than re-copying per action).
-    let exec2 = store.get_executable_hardlink_source(&digest).await?;
+    let exec2 = store
+        .with_executable_hardlink_source(&digest, |path| async move { Ok(path) })
+        .await?;
     assert_eq!(exec1, exec2, "executable variant path must be stable");
     assert_eq!(
         fs::metadata(&exec2).await?.ino(),
@@ -1692,7 +1696,9 @@ async fn evicting_digest_deletes_its_executable_variant() -> Result<(), Error> {
     store.update_oneshot(digest1, VALUE1.into()).await?;
 
     let variant_path = OsString::from(format!("{content_path}.exec/{DIGEST_FOLDER}/{digest1}"));
-    store.get_executable_hardlink_source(&digest1).await?;
+    store
+        .with_executable_hardlink_source(&digest1, |path| async move { Ok(path) })
+        .await?;
     fs::metadata(&variant_path)
         .await
         .err_tip(|| "Executable variant should exist right after creation")?;
@@ -1779,6 +1785,123 @@ async fn executable_variant_remains_pinned_through_materialization_handler() -> 
     let err = fs::metadata(&variant_path)
         .await
         .expect_err("Executable variant must be removed after the handler releases it");
+    assert_eq!(err.code, Code::NotFound);
+
+    Ok(())
+}
+
+/// Cancellation while the blocking publish is running must not release the
+/// executable lock. Otherwise eviction can complete and an orphaned copy can
+/// rename the variant back into place after the primary digest is gone.
+#[cfg(target_family = "unix")]
+#[nativelink_test(flavor = "multi_thread")]
+async fn canceled_executable_creation_cannot_republish_after_eviction() -> Result<(), Error> {
+    static EXEC_RENAME_PAUSE: async_lock::Mutex<()> = async_lock::Mutex::new(());
+    static EXEC_RENAME_IS_PAUSED: AtomicBool = AtomicBool::new(false);
+
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+    let digest1 = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let digest2 = DigestInfo::try_new(HASH2, VALUE2.len())?;
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path,
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        |from, to| {
+            if to.to_string_lossy().contains(".exec/") && EXEC_RENAME_PAUSE.try_lock().is_none() {
+                EXEC_RENAME_IS_PAUSED.store(true, Ordering::Release);
+                while EXEC_RENAME_PAUSE.try_lock().is_none() {
+                    std::thread::yield_now();
+                }
+                EXEC_RENAME_IS_PAUSED.store(false, Ordering::Release);
+            }
+            std::fs::rename(from, to)
+        },
+    )
+    .await?;
+    store.update_oneshot(digest1, VALUE1.into()).await?;
+
+    let rename_pause = EXEC_RENAME_PAUSE.lock().await;
+    let mut creation = store
+        .with_executable_hardlink_source(&digest1, |path| async move {
+            fs::metadata(path).await?;
+            Ok(())
+        })
+        .boxed();
+    while !EXEC_RENAME_IS_PAUSED.load(Ordering::Acquire) {
+        assert!(
+            matches!(poll!(&mut creation), Poll::Pending),
+            "executable creation finished before its publish was paused"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    // Cancel the caller while its detached critical task remains paused in
+    // the blocking rename.
+    drop(creation);
+
+    let mut eviction = store.update_oneshot(digest2, VALUE2.into()).boxed();
+    assert!(
+        matches!(poll!(&mut eviction), Poll::Pending),
+        "eviction completed while the canceled creator still owned its critical section"
+    );
+
+    drop(rename_pause);
+    eviction.await?;
+
+    let variant_path = OsString::from(format!("{content_path}.exec/{DIGEST_FOLDER}/{digest1}"));
+    let err = fs::metadata(variant_path)
+        .await
+        .expect_err("evicted executable variant must not reappear after cancellation");
+    assert_eq!(err.code, Code::NotFound);
+
+    Ok(())
+}
+
+/// Resolving an absent executable variant must not hold the executable lock
+/// while a TTL-expired primary entry runs that lock's eviction callback.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn expired_primary_with_absent_executable_variant_does_not_deadlock() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            max_seconds: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+
+    let variant_path = OsString::from(format!("{content_path}.exec/{DIGEST_FOLDER}/{digest}"));
+    store
+        .with_executable_hardlink_source(&digest, |_path| async move { Ok(()) })
+        .await?;
+    fs::remove_file(&variant_path).await?;
+    sleep(Duration::from_secs(2)).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        store.with_executable_hardlink_source(&digest, |_path| async move { Ok(()) }),
+    )
+    .await
+    .map_err(|_| {
+        make_err!(
+            Code::Internal,
+            "TTL eviction deadlocked executable creation"
+        )
+    })?;
+    let err = result.expect_err("expired primary digest must be reported missing");
     assert_eq!(err.code, Code::NotFound);
 
     Ok(())

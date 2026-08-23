@@ -65,7 +65,7 @@ pub const DIGEST_FOLDER: &str = "d";
 
 /// Suffix for the sibling directory that holds per-digest read-only
 /// **executable** (0o555) variants of CAS blobs (see
-/// [`FilesystemStore::get_executable_hardlink_source`]). It is a sibling of
+/// [`FilesystemStore::with_executable_hardlink_source`]). It is a sibling of
 /// `content_path` rather than a child so the normal content/temp scan and prune
 /// logic never touches it. Cleared on startup; entries are regenerable.
 #[cfg(unix)]
@@ -106,12 +106,20 @@ struct ExecutableLockRegistration {
 
 #[cfg(unix)]
 impl ExecutableLockRegistration {
-    fn new(locks: &ExecutableLocks, digest: DigestInfo, lock: &Arc<Mutex<()>>) -> Self {
+    fn new(locks: &ExecutableLocks, digest: DigestInfo) -> Self {
         Self {
             locks: Arc::clone(locks),
             digest,
-            lock: Arc::clone(lock),
+            // Keep exactly one caller-owned Arc. Together with the map entry,
+            // this makes strong_count == 2 when the final registration drops.
+            // Constructing the registration from a borrowed caller Arc would
+            // leave a third owner alive until after Drop and leak the entry.
+            lock: executable_lock_for_digest(locks, digest),
         }
+    }
+
+    async fn lock(&self) -> async_lock::MutexGuard<'_, ()> {
+        self.lock.lock().await
     }
 }
 
@@ -119,6 +127,65 @@ impl ExecutableLockRegistration {
 impl Drop for ExecutableLockRegistration {
     fn drop(&mut self) {
         forget_executable_lock(&self.locks, &self.digest, &self.lock);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod executable_lock_registration_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    const TEST_HASH: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
+
+    fn test_digest() -> DigestInfo {
+        DigestInfo::try_new(TEST_HASH, 1).expect("valid test digest")
+    }
+
+    fn lock_count(locks: &ExecutableLocks) -> usize {
+        locks.lock().expect("executable_locks poisoned").len()
+    }
+
+    #[test]
+    fn completed_registration_removes_idle_lock() {
+        let locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        futures::executor::block_on(async {
+            let registration = ExecutableLockRegistration::new(&locks, test_digest());
+            let guard = registration.lock().await;
+            assert_eq!(lock_count(&locks), 1);
+            drop(guard);
+            drop(registration);
+        });
+        assert_eq!(lock_count(&locks), 0);
+    }
+
+    #[test]
+    fn failed_registration_removes_idle_lock() {
+        let locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let result = futures::executor::block_on(async {
+            let registration = ExecutableLockRegistration::new(&locks, test_digest());
+            let _guard = registration.lock().await;
+            Err::<(), ()>(())
+        });
+        assert!(result.is_err());
+        assert_eq!(lock_count(&locks), 0);
+    }
+
+    #[test]
+    fn canceled_waiter_preserves_then_removes_shared_lock() {
+        let locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let owner = ExecutableLockRegistration::new(&locks, test_digest());
+        let owner_guard = futures::executor::block_on(owner.lock());
+        let waiter = ExecutableLockRegistration::new(&locks, test_digest());
+
+        let waiting = async move {
+            let _guard = waiter.lock().await;
+        };
+        assert!(waiting.now_or_never().is_none());
+        assert_eq!(lock_count(&locks), 1);
+
+        drop(owner_guard);
+        drop(owner);
+        assert_eq!(lock_count(&locks), 0);
     }
 }
 
@@ -838,7 +905,7 @@ where
 }
 
 /// Deletes a digest's `.exec` variant (see
-/// [`FilesystemStore::get_executable_hardlink_source`]) when that digest is
+/// [`FilesystemStore::with_executable_hardlink_source`]) when that digest is
 /// evicted or replaced in the primary CAS `evicting_map`. Without this, the
 /// `.exec` directory is invisible to `max_bytes` and is only ever cleared by
 /// the startup `remove_dir_all`, so it grows without bound at runtime (#2474).
@@ -857,18 +924,19 @@ impl RemoveItemCallback for ExecutableVariantRemover {
         &'a self,
         store_key: StoreKey<'a>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            let StoreKey::Digest(digest) = store_key else {
-                return;
-            };
-            let lock = executable_lock_for_digest(&self.executable_locks, digest);
-            let _registration =
-                ExecutableLockRegistration::new(&self.executable_locks, digest, &lock);
-            let guard = lock.lock().await;
-            let variant_path = format!(
-                "{}{EXECUTABLE_DIR_SUFFIX}/{DIGEST_FOLDER}/{digest}",
-                self.content_path
-            );
+        let StoreKey::Digest(digest) = store_key else {
+            return Box::pin(async {});
+        };
+        let content_path = self.content_path.clone();
+        let executable_locks = Arc::clone(&self.executable_locks);
+        // Spawn before returning the callback future. Even if the operation
+        // that triggered eviction is canceled before it polls callbacks, this
+        // critical cleanup has already taken ownership of the work.
+        let task = background_spawn!("filesystem_store_remove_executable_variant", async move {
+            let registration = ExecutableLockRegistration::new(&executable_locks, digest);
+            let guard = registration.lock().await;
+            let variant_path =
+                format!("{content_path}{EXECUTABLE_DIR_SUFFIX}/{DIGEST_FOLDER}/{digest}");
             match fs::remove_file(&variant_path).await {
                 Ok(()) => debug!(
                     ?variant_path,
@@ -883,6 +951,12 @@ impl RemoveItemCallback for ExecutableVariantRemover {
                 ),
             }
             drop(guard);
+            drop(registration);
+        });
+        Box::pin(async move {
+            if let Err(err) = task.await {
+                warn!(?err, "Executable-variant removal task failed");
+            }
         })
     }
 }
@@ -942,7 +1016,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
         // Executable-variant directory: a sibling of `content_path` holding
         // per-digest 0o555 copies used as hardlink sources for executable
-        // inputs (see `get_executable_hardlink_source`). Cleared on startup —
+        // inputs (see `with_executable_hardlink_source`). Cleared on startup —
         // the variants are regenerable and we never want a stale one to leak
         // across runs. Unix-only: the executable bit (and the ETXTBSY race it
         // guards against) does not apply on Windows.
@@ -1019,10 +1093,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         .into()
     }
 
-    /// Returns the path to a private, read-only **executable** (0o555) copy of
-    /// the blob for `digest`, creating it at most once. Callers **hardlink**
-    /// the returned path into action input trees instead of copying the
-    /// executable per action.
+    /// Runs `handler` with a private, read-only **executable** (0o555) copy of
+    /// the blob for `digest`, creating it at most once. The handler contract
+    /// keeps eviction exclusion alive through the caller's hardlink or copy;
+    /// returning the path would release that protection too early.
     ///
     /// Why this exists: a CAS blob is stored read-only **0o444** and shared
     /// across actions by hardlink, so it cannot carry the executable bit and
@@ -1035,19 +1109,9 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// **once** — writer fd fsync'd and closed, then atomically renamed into
     /// place before the inode is ever hardlinked or executed — and hardlinking
     /// it thereafter keeps the per-action path hardlink-only.
-    #[cfg(unix)]
-    pub async fn get_executable_hardlink_source(
-        &self,
-        digest: &DigestInfo,
-    ) -> Result<OsString, Error> {
-        self.with_executable_hardlink_source(digest, |path| async move { Ok(path) })
-            .await
-    }
-
-    /// Runs `handler` with a stable executable-variant path. Creation and the
-    /// handler share the same per-digest lock as eviction, so the variant
-    /// cannot be removed after path resolution but before the caller's
-    /// hardlink/copy completes.
+    /// Creation and the handler share the same per-digest lock as eviction,
+    /// so the variant cannot be removed after path resolution but before the
+    /// caller's hardlink/copy completes.
     #[cfg(unix)]
     pub async fn with_executable_hardlink_source<
         T,
@@ -1059,36 +1123,35 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         handler: F,
     ) -> Result<T, Error> {
         let variant_path = self.executable_variant_path(digest);
-        let lock = executable_lock_for_digest(&self.executable_locks, *digest);
-        let _registration = ExecutableLockRegistration::new(&self.executable_locks, *digest, &lock);
-        let guard = lock.lock().await;
+        let mut handler = Some(handler);
+        loop {
+            let registration =
+                ExecutableLockRegistration::new(&self.executable_locks, *digest);
+            let guard = registration.lock().await;
 
-        // Re-check: another task may have constructed it while we waited.
-        let result = async {
-            if fs::metadata(&variant_path).await.is_err() {
-                self.create_executable_variant(digest, &variant_path)
-                    .await?;
+            // Re-check after taking the same lock as eviction. If eviction won
+            // the race after a creator completed, release the lock before
+            // resolving the primary entry for another creation attempt.
+            // EvictingMap::get may itself run the remove callback for a
+            // TTL-expired entry, so resolving it while holding this lock can
+            // self-deadlock.
+            if fs::metadata(&variant_path).await.is_ok() {
+                let result = handler
+                    .take()
+                    .expect("executable handler is called exactly once")(
+                    variant_path.clone(),
+                )
+                .await;
+                drop(guard);
+                drop(registration);
+                return result;
             }
 
-            handler(variant_path.clone()).await
+            drop(guard);
+            drop(registration);
+            self.create_executable_variant(digest, &variant_path)
+                .await?;
         }
-        .await;
-
-        drop(guard);
-        result
-    }
-
-    /// Non-unix has no executable bit and no `ETXTBSY`, so just hardlink the
-    /// CAS blob directly.
-    #[cfg(not(unix))]
-    pub async fn get_executable_hardlink_source(
-        &self,
-        digest: &DigestInfo,
-    ) -> Result<OsString, Error> {
-        let file_entry = self.get_file_entry_for_digest(digest).await?;
-        file_entry
-            .get_file_path_locked(|p| async move { Ok(p) })
-            .await
     }
 
     /// Non-unix has no separate executable variant, but callers use the same
@@ -1108,16 +1171,19 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         file_entry.get_file_path_locked(handler).await
     }
 
-    /// Materializes the 0o555 executable variant for `digest`. Must be called
-    /// under the per-digest single-flight guard.
+    /// Materializes the 0o555 executable variant for `digest` in a detached
+    /// critical task. If the caller is canceled while a blocking filesystem
+    /// operation is running, the task retains both the primary `FileEntry` pin
+    /// and the per-digest exclusion until the operation actually completes.
     #[cfg(unix)]
     async fn create_executable_variant(
         &self,
         digest: &DigestInfo,
         variant_path: &OsStr,
     ) -> Result<(), Error> {
-        // Resolve the on-disk CAS blob (0o444) to copy from. Must be present in
-        // this tier; callers populate the fast store first.
+        // Resolve before taking the executable lock. EvictingMap::get may
+        // lazily reap an expired entry and await the remove callback, which
+        // acquires that same lock.
         let file_entry = self
             .get_file_entry_for_digest(digest)
             .await
@@ -1126,54 +1192,83 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         let mut temp_owned = variant_path.to_os_string();
         temp_owned.push(".tmp");
         let rename_fn = self.rename_fn;
+        let registration =
+            ExecutableLockRegistration::new(&self.executable_locks, *digest);
 
-        // Keep the FileEntry read guard for the entire copy. Eviction needs
-        // the write guard to rename/unref the CAS blob, so the source cannot
-        // disappear between path resolution and std::fs::copy.
-        file_entry
-            .get_file_path_locked(move |src_path| async move {
-                // All of this is blocking std::fs; run it off the async runtime.
-                // The writable fd opened by `copy` is fully closed before the
-                // `rename` publishes the inode, so no reachable hardlink of the
-                // variant ever has an open writer.
-                spawn_blocking!(
-                    "filesystem_store_executable_variant",
-                    move || -> Result<(), Error> {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::copy(&src_path, &temp_owned).map_err(|e| {
-                            make_err!(Code::Internal, "executable-variant copy failed: {e:?}")
-                        })?;
-                        std::fs::set_permissions(
-                            &temp_owned,
-                            std::fs::Permissions::from_mode(0o555),
+        background_spawn!("filesystem_store_create_executable_variant", async move {
+            // The raw task handle detaches on caller cancellation. The task
+            // itself owns the FileEntry and registration, so neither eviction
+            // guard can disappear while spawn_blocking is still running.
+            file_entry
+                .get_file_path_locked(move |src_path| async move {
+                    let guard = registration.lock().await;
+                    let result = async {
+                        // Another detached creator may have completed while we
+                        // waited. Only one task may ever use the shared `.tmp`.
+                        if fs::metadata(&variant_owned).await.is_ok() {
+                            return Ok(());
+                        }
+
+                        // All of this is blocking std::fs; run it off the async runtime.
+                        // The writable fd opened by `copy` is fully closed before the
+                        // `rename` publishes the inode, so no reachable hardlink of the
+                        // variant ever has an open writer.
+                        spawn_blocking!(
+                            "filesystem_store_executable_variant",
+                            move || -> Result<(), Error> {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::copy(&src_path, &temp_owned).map_err(|e| {
+                                    make_err!(
+                                        Code::Internal,
+                                        "executable-variant copy failed: {e:?}"
+                                    )
+                                })?;
+                                std::fs::set_permissions(
+                                    &temp_owned,
+                                    std::fs::Permissions::from_mode(0o555),
+                                )
+                                .map_err(|e| {
+                                    make_err!(
+                                        Code::Internal,
+                                        "executable-variant chmod 0o555 failed: {e:?}"
+                                    )
+                                })?;
+                                // Reopen read-only purely to fsync the bytes durable before publish.
+                                let f = std::fs::File::open(&temp_owned).map_err(|e| {
+                                    make_err!(
+                                        Code::Internal,
+                                        "executable-variant reopen: {e:?}"
+                                    )
+                                })?;
+                                f.sync_all().map_err(|e| {
+                                    make_err!(
+                                        Code::Internal,
+                                        "executable-variant fsync: {e:?}"
+                                    )
+                                })?;
+                                drop(f);
+                                rename_fn(temp_owned.as_os_str(), variant_owned.as_os_str())
+                                    .map_err(|e| {
+                                        make_err!(
+                                            Code::Internal,
+                                            "executable-variant rename failed: {e:?}"
+                                        )
+                                    })?;
+                                Ok(())
+                            }
                         )
-                        .map_err(|e| {
-                            make_err!(
-                                Code::Internal,
-                                "executable-variant chmod 0o555 failed: {e:?}"
-                            )
-                        })?;
-                        // Reopen read-only purely to fsync the bytes durable before publish.
-                        let f = std::fs::File::open(&temp_owned).map_err(|e| {
-                            make_err!(Code::Internal, "executable-variant reopen: {e:?}")
-                        })?;
-                        f.sync_all().map_err(|e| {
-                            make_err!(Code::Internal, "executable-variant fsync: {e:?}")
-                        })?;
-                        drop(f);
-                        rename_fn(temp_owned.as_os_str(), variant_owned.as_os_str()).map_err(
-                            |e| {
-                                make_err!(Code::Internal, "executable-variant rename failed: {e:?}")
-                            },
-                        )?;
-                        Ok(())
+                        .await
+                        .err_tip(|| "executable-variant spawn_blocking join failed")?
                     }
-                )
+                    .await;
+                    drop(guard);
+                    drop(registration);
+                    result
+                })
                 .await
-                .err_tip(|| "executable-variant spawn_blocking join failed")?
-            })
-            .await?;
-        Ok(())
+        })
+        .await
+        .err_tip(|| "executable-variant critical task failed")?
     }
 
     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
