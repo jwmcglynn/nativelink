@@ -285,6 +285,41 @@ const DOWNLOAD_TO_DIRECTORY_CONCURRENCY: usize = 64;
 /// above still applies.
 const DEFAULT_INPUT_MATERIALIZATION_MAX_CONCURRENCY: usize = 0;
 
+/// Slow materialization events are useful for distinguishing time queued on
+/// the worker-wide limiter from time spent doing admitted filesystem work.
+/// Keep the threshold low enough to catch user-visible stalls, but sample each
+/// event class so a saturated worker cannot flood its logs.
+const SLOW_INPUT_MATERIALIZATION_EVENT_THRESHOLD: Duration = Duration::from_secs(1);
+const SLOW_INPUT_MATERIALIZATION_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default)]
+struct InputMaterializationLimiterDiagnostics {
+    last_slow_wait_log: Mutex<Option<Instant>>,
+    last_slow_hold_log: Mutex<Option<Instant>>,
+}
+
+impl InputMaterializationLimiterDiagnostics {
+    fn should_log(last_log: &Mutex<Option<Instant>>) -> bool {
+        let now = Instant::now();
+        let mut last_log = last_log.lock();
+        if last_log.is_some_and(|last_log| {
+            now.duration_since(last_log) < SLOW_INPUT_MATERIALIZATION_LOG_INTERVAL
+        }) {
+            return false;
+        }
+        *last_log = Some(now);
+        true
+    }
+
+    fn should_log_slow_wait(&self) -> bool {
+        Self::should_log(&self.last_slow_wait_log)
+    }
+
+    fn should_log_slow_hold(&self) -> bool {
+        Self::should_log(&self.last_slow_hold_log)
+    }
+}
+
 #[derive(Debug, Default, MetricsComponent)]
 pub(crate) struct InputMaterializationLimiterMetrics {
     #[metric(help = "Current number of input-materialization filesystem tasks holding permits.")]
@@ -305,13 +340,42 @@ pub(crate) struct InputMaterializationLimiterMetrics {
 
 #[derive(Debug)]
 pub(crate) struct InputMaterializationPermit {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
     metrics: Arc<InputMaterializationLimiterMetrics>,
+    diagnostics: Arc<InputMaterializationLimiterDiagnostics>,
+    acquired_at: Instant,
+    waited_for: Option<Duration>,
 }
 
 impl Drop for InputMaterializationPermit {
     fn drop(&mut self) {
+        let held_for = self.acquired_at.elapsed();
         self.metrics.in_flight_tasks.fetch_sub(1, Ordering::AcqRel);
+        drop(self.permit.take());
+        let in_flight_after_release = self.metrics.in_flight_tasks.load(Ordering::Acquire);
+
+        if let Some(waited_for) = self.waited_for
+            && waited_for >= SLOW_INPUT_MATERIALIZATION_EVENT_THRESHOLD
+            && self.diagnostics.should_log_slow_wait()
+        {
+            info!(
+                waited_ms = u64::try_from(waited_for.as_millis()).unwrap_or(u64::MAX),
+                in_flight_after_release,
+                effective_max_concurrency = self
+                    .metrics
+                    .effective_max_concurrency
+                    .load(Ordering::Acquire),
+                "Slow input materialization permit wait"
+            );
+        }
+        if held_for >= SLOW_INPUT_MATERIALIZATION_EVENT_THRESHOLD
+            && self.diagnostics.should_log_slow_hold()
+        {
+            info!(
+                held_ms = u64::try_from(held_for.as_millis()).unwrap_or(u64::MAX),
+                in_flight_after_release, "Slow input materialization permit hold"
+            );
+        }
     }
 }
 
@@ -319,6 +383,7 @@ impl Drop for InputMaterializationPermit {
 pub(crate) struct InputMaterializationLimiter {
     semaphore: Arc<Semaphore>,
     metrics: Arc<InputMaterializationLimiterMetrics>,
+    diagnostics: Arc<InputMaterializationLimiterDiagnostics>,
 }
 
 impl InputMaterializationLimiter {
@@ -346,14 +411,18 @@ impl InputMaterializationLimiter {
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
             metrics,
+            diagnostics: Arc::default(),
         }
     }
 
     pub(crate) async fn acquire(&self) -> Result<InputMaterializationPermit, Error> {
+        let mut waited_for = None;
         let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                self.metrics
+                let wait_started_at = Instant::now();
+                let permit = self
+                    .metrics
                     .permit_waits
                     .wrap(async {
                         Arc::clone(&self.semaphore)
@@ -366,7 +435,9 @@ impl InputMaterializationLimiter {
                                 )
                             })
                     })
-                    .await?
+                    .await?;
+                waited_for = Some(wait_started_at.elapsed());
+                permit
             }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 return Err(make_err!(
@@ -382,8 +453,11 @@ impl InputMaterializationLimiter {
             .peak_in_flight_tasks
             .fetch_max(in_flight_tasks, Ordering::AcqRel);
         Ok(InputMaterializationPermit {
-            _permit: permit,
+            permit: Some(permit),
             metrics: Arc::clone(&self.metrics),
+            diagnostics: Arc::clone(&self.diagnostics),
+            acquired_at: Instant::now(),
+            waited_for,
         })
     }
 
@@ -464,6 +538,78 @@ mod input_materialization_limiter_tests {
         assert!(logs_contain("configured_max_concurrency"));
         assert!(logs_contain("effective_max_concurrency"));
         drop(permit);
+        Ok(())
+    }
+
+    #[nativelink_test(start_paused = true)]
+    async fn logs_sampled_slow_waits_and_holds() -> Result<(), Error> {
+        async fn exercise_contention(
+            limiter: &InputMaterializationLimiter,
+            duration: Duration,
+        ) -> Result<(), Error> {
+            let held_permit = limiter.acquire().await?;
+            let waiting_limiter = limiter.clone();
+            let waiting_permit = waiting_limiter.acquire();
+            tokio::pin!(waiting_permit);
+            assert!(matches!(
+                futures::poll!(waiting_permit.as_mut()),
+                Poll::Pending
+            ));
+            tokio::time::advance(duration).await;
+            drop(held_permit);
+            drop(waiting_permit.await?);
+            Ok(())
+        }
+
+        let assert_log_counts = |expected_waits, expected_holds| {
+            logs_assert(|lines: &[&str]| {
+                let slow_waits = lines
+                    .iter()
+                    .filter(|line| line.contains("Slow input materialization permit wait"))
+                    .count();
+                let slow_holds = lines
+                    .iter()
+                    .filter(|line| line.contains("Slow input materialization permit hold"))
+                    .count();
+                if slow_waits != expected_waits || slow_holds != expected_holds {
+                    return Err(format!(
+                        "expected waits={expected_waits} holds={expected_holds}, got waits={slow_waits} holds={slow_holds}: {lines:?}"
+                    ));
+                }
+                Ok(())
+            });
+        };
+
+        let below_threshold_limiter = InputMaterializationLimiter::new(1);
+        exercise_contention(&below_threshold_limiter, Duration::from_millis(999)).await?;
+        assert_log_counts(0, 0);
+
+        let limiter = InputMaterializationLimiter::new(1);
+        exercise_contention(&limiter, Duration::from_secs(1)).await?;
+        let sampled_limiter = limiter.clone();
+        exercise_contention(&sampled_limiter, Duration::from_secs(1)).await?;
+        assert_log_counts(1, 1);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        exercise_contention(&limiter, Duration::from_secs(1)).await?;
+        assert_log_counts(2, 2);
+
+        logs_assert(|lines: &[&str]| {
+            if !lines.iter().any(|line| {
+                line.contains("Slow input materialization permit wait")
+                    && line.contains("waited_ms=1000")
+                    && line.contains("effective_max_concurrency=1")
+            }) {
+                return Err(format!("missing exact wait attribution: {lines:?}"));
+            }
+            if !lines.iter().any(|line| {
+                line.contains("Slow input materialization permit hold")
+                    && line.contains("held_ms=1000")
+            }) {
+                return Err(format!("missing exact hold attribution: {lines:?}"));
+            }
+            Ok(())
+        });
         Ok(())
     }
 
