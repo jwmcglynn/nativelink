@@ -877,3 +877,342 @@ async fn snapshot_display_info() -> Result<(), Error> {
     );
     Ok(())
 }
+
+#[derive(Debug)]
+struct RecordedWeightEntry {
+    size: u64,
+    removals: AtomicU64,
+    unrefs: AtomicU64,
+}
+
+impl LenEntry for RecordedWeightEntry {
+    fn len(&self) -> u64 {
+        self.size
+    }
+
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    fn on_remove(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.removals.fetch_add(1, Ordering::SeqCst);
+        core::future::ready(())
+    }
+
+    async fn unref(&self) {
+        self.unrefs.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+type RecordedWeightMap = EvictingMap<u64, u64, Arc<RecordedWeightEntry>, MockInstantWrapped>;
+
+fn recorded_weight_entry(size: u64) -> Arc<RecordedWeightEntry> {
+    Arc::new(RecordedWeightEntry {
+        size,
+        removals: AtomicU64::new(0),
+        unrefs: AtomicU64::new(0),
+    })
+}
+
+fn recorded_weight_map(policy: EvictionPolicy) -> RecordedWeightMap {
+    RecordedWeightMap::new(&policy, MockInstantWrapped::default())
+}
+
+fn assert_recorded_bytes(map: &RecordedWeightMap, expected: u64) {
+    let snapshot = map.get_snapshot().to_string();
+    let prefix = format!("Bytes: {expected} of ");
+    assert!(
+        snapshot.starts_with(prefix.as_str()),
+        "expected {expected} charged bytes, got {snapshot}"
+    );
+}
+
+#[nativelink_test]
+async fn recorded_weight_preserves_reported_size_and_remove_charge() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy::default());
+    let entry = recorded_weight_entry(4);
+    map.insert(1, Arc::clone(&entry)).await;
+
+    assert!(
+        map.reweight_if(&1, 8, |current| Arc::ptr_eq(current, &entry))
+            .await
+    );
+    assert!(
+        map.reweight_if(&1, 8, |current| Arc::ptr_eq(current, &entry))
+            .await
+    );
+    assert_eq!(map.size_for_key(&1).await, Some(4));
+    assert_recorded_bytes(&map, 8);
+
+    assert!(map.remove(&1).await);
+    assert_recorded_bytes(&map, 0);
+    assert_eq!(entry.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(entry.unrefs.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn recorded_weight_replacement_rejects_obsolete_rollback() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy::default());
+    let old = recorded_weight_entry(4);
+    let replacement = recorded_weight_entry(3);
+    map.insert(1, Arc::clone(&old)).await;
+    assert!(
+        map.reweight_if(&1, 8, |current| Arc::ptr_eq(current, &old))
+            .await
+    );
+    map.insert(1, Arc::clone(&replacement)).await;
+
+    assert!(!map.contains_if(&1, |current| Arc::ptr_eq(current, &old)));
+    assert!(map.contains_if(&1, |current| Arc::ptr_eq(current, &replacement)));
+    assert!(
+        !map.reweight_if(&1, 4, |current| Arc::ptr_eq(current, &old))
+            .await
+    );
+    assert!(
+        !map.remove_if(&1, |current| Arc::ptr_eq(current, &old))
+            .await
+    );
+    assert!(!map.reweight_if(&2, 4, |_| true).await);
+    assert_recorded_bytes(&map, 3);
+    assert_eq!(map.size_for_key(&1).await, Some(3));
+    assert_eq!(old.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.removals.load(Ordering::SeqCst), 0);
+
+    assert!(
+        map.remove_if(&1, |current| Arc::ptr_eq(current, &replacement))
+            .await
+    );
+    assert_recorded_bytes(&map, 0);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn recorded_weight_batch_replacement_and_remove_if_balance() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy::default());
+    let old = recorded_weight_entry(4);
+    let neighbor = recorded_weight_entry(2);
+    let replacement = recorded_weight_entry(3);
+    let last = recorded_weight_entry(1);
+    map.insert_many([(1, Arc::clone(&old)), (2, Arc::clone(&neighbor))])
+        .await;
+    assert!(
+        map.reweight_if(&1, 8, |current| Arc::ptr_eq(current, &old))
+            .await
+    );
+    assert_recorded_bytes(&map, 10);
+
+    let replaced = map
+        .insert_many([(1, Arc::clone(&replacement)), (3, Arc::clone(&last))])
+        .await;
+    assert_eq!(replaced.len(), 1);
+    assert!(Arc::ptr_eq(&replaced[0], &old));
+    assert_recorded_bytes(&map, 6);
+    let mut sizes = [None; 3];
+    map.sizes_for_keys([1, 2, 3].iter(), &mut sizes, true).await;
+    assert_eq!(sizes, [Some(3), Some(2), Some(1)]);
+
+    assert!(
+        map.reweight_if(&2, 5, |current| Arc::ptr_eq(current, &neighbor))
+            .await
+    );
+    assert_recorded_bytes(&map, 9);
+    assert_eq!(map.size_for_key(&2).await, Some(2));
+    assert!(
+        map.remove_if(&2, |current| Arc::ptr_eq(current, &neighbor))
+            .await
+    );
+    assert_recorded_bytes(&map, 4);
+    assert!(
+        map.remove_if(&1, |current| Arc::ptr_eq(current, &replacement))
+            .await
+    );
+    assert_recorded_bytes(&map, 1);
+    assert!(map.remove(&3).await);
+    assert_recorded_bytes(&map, 0);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn recorded_weight_ttl_removal_balances() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy {
+        max_seconds: 1,
+        ..Default::default()
+    });
+    let entry = recorded_weight_entry(4);
+    map.insert(1, Arc::clone(&entry)).await;
+    assert!(
+        map.reweight_if(&1, 8, |current| Arc::ptr_eq(current, &entry))
+            .await
+    );
+    MockClock::advance(Duration::from_secs(2));
+
+    assert!(map.get(&1).await.is_none());
+    assert_recorded_bytes(&map, 0);
+    assert_eq!(entry.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(entry.unrefs.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn recorded_weight_overflow_preserves_generation_and_charge() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy::default());
+    let entry = recorded_weight_entry(4);
+    let neighbor = recorded_weight_entry(1);
+    map.insert_many([(1, Arc::clone(&entry)), (2, Arc::clone(&neighbor))])
+        .await;
+
+    assert!(
+        !map.reweight_if(&1, u64::MAX, |current| Arc::ptr_eq(current, &entry))
+            .await
+    );
+    assert_recorded_bytes(&map, 5);
+    assert!(map.contains_if(&1, |current| Arc::ptr_eq(current, &entry)));
+    assert!(map.contains_if(&2, |current| Arc::ptr_eq(current, &neighbor)));
+    assert_eq!(map.size_for_key(&1).await, Some(4));
+    assert_eq!(entry.removals.load(Ordering::SeqCst), 0);
+    assert_eq!(neighbor.removals.load(Ordering::SeqCst), 0);
+    assert!(map.remove(&1).await);
+    assert_recorded_bytes(&map, 1);
+    assert!(map.remove(&2).await);
+    assert_recorded_bytes(&map, 0);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn recorded_weight_self_eviction_returns_false() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy {
+        max_bytes: 8,
+        ..Default::default()
+    });
+    let entry = recorded_weight_entry(4);
+    map.insert(1, Arc::clone(&entry)).await;
+
+    let admitted = tokio::time::timeout(
+        Duration::from_secs(5),
+        map.reweight_if(&1, 9, |current| Arc::ptr_eq(current, &entry)),
+    )
+    .await
+    .expect("reservation self-eviction must finish cleanup");
+    assert!(!admitted);
+    assert!(!map.contains_if(&1, |_| true));
+    assert_recorded_bytes(&map, 0);
+    assert_eq!(entry.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(entry.unrefs.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn arc_removal_hook_runs_once_per_generation() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy::default());
+    let old = recorded_weight_entry(1);
+    let replacement = recorded_weight_entry(2);
+    map.insert(1, Arc::clone(&old)).await;
+    assert_eq!(old.removals.load(Ordering::SeqCst), 0);
+    map.insert(1, Arc::clone(&replacement)).await;
+    assert_eq!(old.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(old.unrefs.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.removals.load(Ordering::SeqCst), 0);
+
+    assert!(map.remove(&1).await);
+    assert!(!map.remove(&1).await);
+    assert_eq!(old.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.unrefs.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn contains_if_does_not_reap_or_refresh_ttl() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy {
+        max_seconds: 10,
+        ..Default::default()
+    });
+    let entry = recorded_weight_entry(4);
+    map.insert(1, Arc::clone(&entry)).await;
+    MockClock::advance(Duration::from_secs(5));
+    assert!(map.contains_if(&1, |current| Arc::ptr_eq(current, &entry)));
+    MockClock::advance(Duration::from_secs(6));
+
+    assert!(map.contains_if(&1, |current| Arc::ptr_eq(current, &entry)));
+    assert!(!map.contains_if(&2, |_| true));
+    assert_recorded_bytes(&map, 4);
+    assert_eq!(entry.removals.load(Ordering::SeqCst), 0);
+    assert_eq!(entry.unrefs.load(Ordering::SeqCst), 0);
+    assert!(map.get(&1).await.is_none());
+    assert_recorded_bytes(&map, 0);
+    assert_eq!(entry.removals.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn contains_if_does_not_touch_lru_order() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy {
+        max_count: 2,
+        ..Default::default()
+    });
+    let oldest = recorded_weight_entry(1);
+    let neighbor = recorded_weight_entry(1);
+    let newest = recorded_weight_entry(1);
+    map.insert_many([(1, Arc::clone(&oldest)), (2, Arc::clone(&neighbor))])
+        .await;
+    assert!(map.contains_if(&1, |current| Arc::ptr_eq(current, &oldest)));
+    map.insert(3, Arc::clone(&newest)).await;
+
+    assert!(!map.contains_if(&1, |_| true));
+    assert!(map.contains_if(&2, |current| Arc::ptr_eq(current, &neighbor)));
+    assert!(map.contains_if(&3, |current| Arc::ptr_eq(current, &newest)));
+    assert_eq!(oldest.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(neighbor.removals.load(Ordering::SeqCst), 0);
+    assert_recorded_bytes(&map, 2);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn recorded_weight_reservation_evicts_neighbor_and_retains_generation() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy {
+        max_bytes: 10,
+        ..Default::default()
+    });
+    let oldest = recorded_weight_entry(4);
+    let reserved = recorded_weight_entry(4);
+    map.insert_many([(1, Arc::clone(&oldest)), (2, Arc::clone(&reserved))])
+        .await;
+
+    assert!(
+        map.reweight_if(&2, 8, |current| Arc::ptr_eq(current, &reserved))
+            .await
+    );
+    assert!(!map.contains_if(&1, |_| true));
+    assert!(map.contains_if(&2, |current| Arc::ptr_eq(current, &reserved)));
+    assert_eq!(map.size_for_key(&2).await, Some(4));
+    assert_recorded_bytes(&map, 8);
+    assert_eq!(oldest.removals.load(Ordering::SeqCst), 1);
+    assert_eq!(reserved.removals.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn recorded_weight_batch_eviction_uses_reserved_charge() -> Result<(), Error> {
+    let map = recorded_weight_map(EvictionPolicy {
+        max_bytes: 10,
+        ..Default::default()
+    });
+    let oldest = recorded_weight_entry(4);
+    let second = recorded_weight_entry(1);
+    let third = recorded_weight_entry(1);
+    map.insert(1, Arc::clone(&oldest)).await;
+    assert!(
+        map.reweight_if(&1, 8, |current| Arc::ptr_eq(current, &oldest))
+            .await
+    );
+    map.insert_many([(2, Arc::clone(&second)), (3, Arc::clone(&third))])
+        .await;
+
+    assert!(!map.contains_if(&1, |_| true));
+    assert!(map.contains_if(&2, |current| Arc::ptr_eq(current, &second)));
+    assert!(map.contains_if(&3, |current| Arc::ptr_eq(current, &third)));
+    assert_eq!(oldest.removals.load(Ordering::SeqCst), 1);
+    assert_recorded_bytes(&map, 2);
+    Ok(())
+}

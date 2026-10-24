@@ -13,25 +13,23 @@
 // limitations under the License.
 
 use core::fmt::{Debug, Formatter};
+use core::hash::Hash;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
-#[cfg(unix)]
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
-#[cfg(unix)]
-use async_lock::Mutex;
-use async_lock::RwLock;
+use async_lock::{Mutex, RwLock};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{StreamExt, TryStreamExt};
 use futures::{Future, TryFutureExt};
 use nativelink_config::stores::FilesystemSpec;
-use nativelink_error::{Code, Error, ResultExt, make_err};
+use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::background_spawn;
 use nativelink_util::buf_channel::{
@@ -50,7 +48,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, Take};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReadDirStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::callback_utils::RemoveItemCallbackHolder;
 use crate::cas_utils::is_zero_digest;
@@ -71,63 +69,73 @@ pub const DIGEST_FOLDER: &str = "d";
 #[cfg(unix)]
 const EXECUTABLE_DIR_SUFFIX: &str = ".exec";
 
-#[cfg(unix)]
-type ExecutableLocks = Arc<std::sync::Mutex<HashMap<DigestInfo, Arc<Mutex<()>>>>>;
+type KeyLocks<K> = Arc<std::sync::Mutex<HashMap<K, Arc<Mutex<()>>>>>;
 
-#[cfg(unix)]
-fn executable_lock_for_digest(locks: &ExecutableLocks, digest: DigestInfo) -> Arc<Mutex<()>> {
-    let mut locks = locks.lock().expect("executable_locks poisoned");
-    locks
-        .entry(digest)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
-#[cfg(unix)]
-fn forget_executable_lock(locks: &ExecutableLocks, digest: &DigestInfo, lock: &Arc<Mutex<()>>) {
-    let mut locks = locks.lock().expect("executable_locks poisoned");
-    let Some(current) = locks.get(digest) else {
-        return;
-    };
-    // The map and this caller are the only owners only when no waiter can
-    // still acquire this lock. New callers clone while holding the map lock,
-    // so removing at strong_count == 2 cannot split single-flight ownership.
-    if Arc::ptr_eq(current, lock) && Arc::strong_count(lock) == 2 {
-        locks.remove(digest);
-    }
-}
-
-#[cfg(unix)]
-struct ExecutableLockRegistration {
-    locks: ExecutableLocks,
-    digest: DigestInfo,
+struct KeyLockRegistration<K: Clone + Eq + Hash> {
+    locks: KeyLocks<K>,
+    key: K,
     lock: Arc<Mutex<()>>,
 }
 
-#[cfg(unix)]
-impl ExecutableLockRegistration {
-    fn new(locks: &ExecutableLocks, digest: DigestInfo) -> Self {
+impl<K: Clone + Eq + Hash> KeyLockRegistration<K> {
+    fn new(locks: &KeyLocks<K>, key: K) -> Self {
+        let lock = locks
+            .lock()
+            .expect("key lock registry poisoned")
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
         Self {
             locks: Arc::clone(locks),
-            digest,
-            // Keep exactly one caller-owned Arc. Together with the map entry,
-            // this makes strong_count == 2 when the final registration drops.
-            // Constructing the registration from a borrowed caller Arc would
-            // leave a third owner alive until after Drop and leak the entry.
-            lock: executable_lock_for_digest(locks, digest),
+            key,
+            lock,
         }
     }
 
-    async fn lock(&self) -> async_lock::MutexGuard<'_, ()> {
+    async fn lock(&self) -> async_lock::MutexGuard<'_, ()>
+    where
+        K: Send + Sync,
+    {
         self.lock.lock().await
     }
 }
 
-#[cfg(unix)]
-impl Drop for ExecutableLockRegistration {
+impl<K: Clone + Eq + Hash> Drop for KeyLockRegistration<K> {
     fn drop(&mut self) {
-        forget_executable_lock(&self.locks, &self.digest, &self.lock);
+        let mut locks = self.locks.lock().expect("key lock registry poisoned");
+        if let Some(current) = locks.get(&self.key) {
+            // Every waiter clones its lock while holding this registry mutex.
+            if Arc::ptr_eq(current, &self.lock) && Arc::strong_count(&self.lock) == 2 {
+                locks.remove(&self.key);
+            }
+        }
     }
+}
+
+#[cfg(unix)]
+type ExecutableLocks = KeyLocks<DigestInfo>;
+#[cfg(unix)]
+type ExecutableLockRegistration = KeyLockRegistration<DigestInfo>;
+type PathOwner = Weak<RwLock<EncodedFilePath>>;
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutableCreation {
+    Ready,
+    Superseded,
+}
+
+#[cfg(test)]
+type ExecutablePause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct PendingExecutable {
+    owner: PathOwner,
+    path: OsString,
 }
 
 #[cfg(all(test, unix))]
@@ -207,6 +215,43 @@ pub struct SharedContext {
     temp_path: String,
     #[metric(help = "Path to the configured content path")]
     content_path: String,
+    content_locks: KeyLocks<StoreKey<'static>>,
+    content_owners: std::sync::Mutex<HashMap<StoreKey<'static>, PathOwner>>,
+    #[cfg(unix)]
+    executable_locks: ExecutableLocks,
+    #[cfg(unix)]
+    executable_owners: std::sync::Mutex<HashMap<DigestInfo, PathOwner>>,
+    #[cfg(unix)]
+    pending_executables: std::sync::Mutex<HashMap<DigestInfo, PendingExecutable>>,
+    /// A failed private-temp cleanup requires filesystem recovery and reopening the store.
+    /// Already-admitted writes may finish; this is not a physical peak-byte limit.
+    write_admission_failed: AtomicBool,
+    #[cfg(test)]
+    retirement_observer: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    executable_reservation_pause: std::sync::Mutex<Option<ExecutablePause>>,
+    #[cfg(test)]
+    executable_ready_pause: std::sync::Mutex<Option<ExecutablePause>>,
+}
+
+impl SharedContext {
+    fn stop_new_allocations(&self) {
+        if !self.write_admission_failed.swap(true, Ordering::AcqRel) {
+            warn!(
+                "Unreclaimed filesystem allocation prevents new allocations; recover the filesystem and reopen the store"
+            );
+        }
+    }
+
+    fn check_write_admission(&self) -> Result<(), Error> {
+        if self.write_admission_failed.load(Ordering::Acquire) {
+            return Err(make_err!(
+                Code::ResourceExhausted,
+                "Unreclaimed filesystem allocation prevents new allocations; recover the filesystem and reopen the store"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Eq, PartialEq, Debug)]
@@ -226,6 +271,7 @@ pub struct EncodedFilePath {
     shared_context: Arc<SharedContext>,
     path_type: PathType,
     key: StoreKey<'static>,
+    registered_key: Option<StoreKey<'static>>,
 }
 
 impl EncodedFilePath {
@@ -251,6 +297,33 @@ fn get_file_path_raw<'a>(
 
 impl Drop for EncodedFilePath {
     fn drop(&mut self) {
+        if let Some(key) = &self.registered_key {
+            let mut owners = self
+                .shared_context
+                .content_owners
+                .lock()
+                .expect("content owner registry poisoned");
+            if owners
+                .get(key)
+                .is_some_and(|owner| owner.strong_count() == 0)
+            {
+                owners.remove(key);
+            }
+        }
+        #[cfg(unix)]
+        if let Some(StoreKey::Digest(digest)) = &self.registered_key {
+            let mut owners = self
+                .shared_context
+                .executable_owners
+                .lock()
+                .expect("executable owner registry poisoned");
+            if owners
+                .get(digest)
+                .is_some_and(|owner| owner.strong_count() == 0)
+            {
+                owners.remove(digest);
+            }
+        }
         // `drop()` can be called during shutdown, so we use `path_type` flag to know if the
         // file actually needs to be deleted.
         if self.path_type == PathType::Content {
@@ -278,7 +351,10 @@ impl Drop for EncodedFilePath {
                 Err(err) if err.code == Code::NotFound => {
                     debug!(?file_path, "File already gone, nothing to delete");
                 }
-                Err(err) => error!(?file_path, ?err, "Failed to delete file"),
+                Err(err) => {
+                    shared_context.stop_new_allocations();
+                    error!(?file_path, ?err, "Failed to delete file");
+                }
             }
             // .fetch_sub returns previous value, so we subtract one to get approximate current value
             let current_active_drop_spawns = shared_context
@@ -292,6 +368,56 @@ impl Drop for EncodedFilePath {
             );
         });
     }
+}
+
+fn current_content_owner(
+    context: &SharedContext,
+    key: &StoreKey<'static>,
+) -> Option<Arc<RwLock<EncodedFilePath>>> {
+    let owner = context
+        .content_owners
+        .lock()
+        .expect("content owner registry poisoned")
+        .get(key)
+        .cloned();
+    owner.and_then(|owner| owner.upgrade())
+}
+
+async fn publish_file_generation<Fe: FileEntry>(
+    map: &Arc<FsEvictingMap<'_, Fe>>,
+    key: &StoreKey<'static>,
+    entry: &Arc<Fe>,
+    rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
+) -> Result<(), Error> {
+    let path = entry.get_encoded_file_path();
+    let context = Arc::clone(&path.read().await.shared_context);
+    let registration = KeyLockRegistration::new(&context.content_locks, key.clone());
+    let _gate = registration.lock().await;
+    if !map.contains_if(key, |current| Arc::ptr_eq(current, entry)) {
+        return Ok(());
+    }
+    // Never upgrade a Weak under its registry mutex: the last Arc's Drop takes that mutex.
+    if let Some(previous) = current_content_owner(&context, key)
+        && !Arc::ptr_eq(&previous, path)
+    {
+        let mut encoded = previous.write().await;
+        retire_locked_path(&mut encoded, &Arc::downgrade(&previous)).await?;
+    }
+    let mut encoded = path.write().await;
+    let from = encoded.get_file_path().into_owned();
+    let to = get_file_path_raw(&PathType::Content, &context, key).into_owned();
+    if !map.contains_if(key, |current| Arc::ptr_eq(current, entry)) {
+        return Ok(());
+    }
+    rename_fn(&from, &to).err_tip(|| "Failed to publish content generation")?;
+    encoded.path_type = PathType::Content;
+    encoded.key = key.clone();
+    context
+        .content_owners
+        .lock()
+        .expect("content owner registry poisoned")
+        .insert(key.clone(), Arc::downgrade(path));
+    Ok(())
 }
 
 /// This creates the file path from the [`StoreKey`]. If
@@ -335,7 +461,7 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     fn size_on_disk(&self) -> u64;
 
     /// Gets the underlying `EncodedfilePath`.
-    fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath>;
+    fn get_encoded_file_path(&self) -> &Arc<RwLock<EncodedFilePath>>;
 
     /// Returns a reader that will read part of the underlying file.
     fn read_file_part(
@@ -361,21 +487,41 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
 }
 
 pub struct FileEntryImpl {
+    shared_context: Arc<SharedContext>,
     data_size: u64,
     block_size: u64,
     // We lock around this as it gets rewritten when we move between temp and content types
-    encoded_file_path: RwLock<EncodedFilePath>,
+    encoded_file_path: Arc<RwLock<EncodedFilePath>>,
 }
 
 impl FileEntryImpl {
     pub fn get_shared_context_for_test(&mut self) -> Arc<SharedContext> {
-        self.encoded_file_path.get_mut().shared_context.clone()
+        Arc::clone(&self.shared_context)
     }
 }
 
 impl FileEntry for FileEntryImpl {
-    fn create(data_size: u64, block_size: u64, encoded_file_path: RwLock<EncodedFilePath>) -> Self {
+    fn create(
+        data_size: u64,
+        block_size: u64,
+        mut encoded_file_path: RwLock<EncodedFilePath>,
+    ) -> Self {
+        let shared_context = Arc::clone(&encoded_file_path.get_mut().shared_context);
+        let initial_owner = {
+            let path = encoded_file_path.get_mut();
+            (path.path_type == PathType::Content)
+                .then(|| (Arc::clone(&path.shared_context), path.key.clone()))
+        };
+        let encoded_file_path = Arc::new(encoded_file_path);
+        if let Some((context, key)) = initial_owner {
+            context
+                .content_owners
+                .lock()
+                .expect("content owner registry poisoned")
+                .insert(key, Arc::downgrade(&encoded_file_path));
+        }
         Self {
+            shared_context,
             data_size,
             block_size,
             encoded_file_path,
@@ -434,7 +580,7 @@ impl FileEntry for FileEntryImpl {
         self.data_size.div_ceil(self.block_size) * self.block_size
     }
 
-    fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath> {
+    fn get_encoded_file_path(&self) -> &Arc<RwLock<EncodedFilePath>> {
         &self.encoded_file_path
     }
 
@@ -504,74 +650,237 @@ impl LenEntry for FileEntryImpl {
         self.data_size == 0
     }
 
-    // unref() only triggers when an item is removed from the eviction_map. It is possible
-    // that another place in code has a reference to `FileEntryImpl` and may later read the
-    // file. To support this edge case, we first move the file to a temp file and point
-    // target file location to the new temp file. `unref()` should only ever be called once.
-    #[inline]
+    fn on_remove(&self) -> impl Future<Output = ()> + Send + 'static {
+        let path = Arc::clone(&self.encoded_file_path);
+        // Start owned work before returning; dropping a caller cannot skip retirement.
+        let task = background_spawn!("filesystem_store_retire_generation", async move {
+            let context = Arc::clone(&path.read().await.shared_context);
+            #[cfg(unix)]
+            let key = path.read().await.registered_key.clone();
+            if let Err(err) = retire_file_path(&path).await {
+                context.stop_new_allocations();
+                warn!(?err, "Failed to retire removed file generation");
+            }
+            #[cfg(unix)]
+            if let Some(StoreKey::Digest(digest)) = key {
+                remove_executable_generation(&context, digest, &path).await;
+            }
+            #[cfg(test)]
+            {
+                let sender = context
+                    .retirement_observer
+                    .lock()
+                    .expect("retirement observer poisoned")
+                    .take();
+                if let Some(sender) = sender {
+                    let _ = sender.send(());
+                }
+            }
+        });
+        async move {
+            if let Err(err) = task.await {
+                warn!(?err, "File generation retirement task failed");
+            }
+        }
+    }
+
     async fn unref(&self) {
-        let mut encoded_file_path = self.encoded_file_path.write().await;
-        if encoded_file_path.path_type == PathType::Temp {
-            // We are already a temp file that is now marked for deletion on drop.
-            // This is very rare, but most likely the rename into the content path failed.
-            warn!(
-                key = ?encoded_file_path.key,
-                "File is already a temp file",
+        if let Err(err) = retire_file_path(&self.encoded_file_path).await {
+            self.shared_context.stop_new_allocations();
+            warn!(?err, "Failed to retire file generation");
+        }
+    }
+}
+
+fn forget_content_owner(context: &SharedContext, key: &StoreKey<'static>, owner: &PathOwner) {
+    let mut owners = context
+        .content_owners
+        .lock()
+        .expect("content owner registry poisoned");
+    if owners
+        .get(key)
+        .is_some_and(|current| Weak::ptr_eq(current, owner))
+    {
+        owners.remove(key);
+    }
+}
+
+async fn retire_locked_path(encoded: &mut EncodedFilePath, owner: &PathOwner) -> Result<(), Error> {
+    if encoded.path_type == PathType::Temp {
+        debug!(key = ?encoded.key, "File is already a temp file");
+        return Ok(());
+    }
+    if encoded.path_type == PathType::Content {
+        let is_owner = encoded
+            .shared_context
+            .content_owners
+            .lock()
+            .expect("content owner registry poisoned")
+            .get(&encoded.key)
+            .is_some_and(|current| Weak::ptr_eq(current, owner));
+        if !is_owner {
+            return Err(make_err!(
+                Code::Internal,
+                "Content pathname belongs to another generation"
+            ));
+        }
+    }
+    let from = encoded.get_file_path().into_owned();
+    let new_key = make_temp_key(&encoded.key);
+    let to = to_full_path_from_key(&encoded.shared_context.temp_path, &new_key);
+    if let Err(err) = fs::rename(&from, &to).await {
+        let source_gone = err.code == Code::NotFound
+            && matches!(fs::metadata(&from).await, Err(meta) if meta.code == Code::NotFound);
+        if !source_gone {
+            return Err(err).err_tip(|| "Failed to rename file");
+        }
+        debug!(key = ?encoded.key, "Failed to rename file (already gone, treating as benign)");
+    }
+    if encoded.path_type == PathType::Content {
+        forget_content_owner(&encoded.shared_context, &encoded.key, owner);
+    }
+    encoded.path_type = PathType::Temp;
+    encoded.key = new_key;
+    Ok(())
+}
+
+async fn retire_file_path(path: &Arc<RwLock<EncodedFilePath>>) -> Result<(), Error> {
+    let (context, key) = {
+        let encoded = path.read().await;
+        if encoded.path_type == PathType::Temp {
+            debug!(key = ?encoded.key, "File is already a temp file");
+            return Ok(());
+        }
+        (Arc::clone(&encoded.shared_context), encoded.key.clone())
+    };
+    let registration = KeyLockRegistration::new(&context.content_locks, key);
+    let _gate = registration.lock().await;
+    let mut encoded = path.write().await;
+    retire_locked_path(&mut encoded, &Arc::downgrade(path)).await
+}
+
+#[cfg(test)]
+async fn wait_for_executable_pause(slot: &std::sync::Mutex<Option<ExecutablePause>>) {
+    let pause = slot.lock().expect("executable pause poisoned").take();
+    if let Some((entered, resume)) = pause {
+        let _ = entered.send(());
+        let _ = resume.await;
+    }
+}
+
+#[cfg(unix)]
+fn executable_reservation_bytes(data_size: u64, block_size: u64) -> Option<(u64, u64)> {
+    if block_size == 0 {
+        return None;
+    }
+    let primary = data_size.div_ceil(block_size).checked_mul(block_size)?;
+    Some((primary, primary.checked_mul(2)?))
+}
+
+#[cfg(unix)]
+fn copy_executable_variant(
+    source: &OsStr,
+    variant: &OsStr,
+    rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
+) -> (Result<(), Error>, bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut temporary = variant.to_os_string();
+    temporary.push(".tmp");
+    let result = (|| {
+        std::fs::copy(source, &temporary).err_tip(|| "Executable copy failed")?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o555))
+            .err_tip(|| "Executable permissions failed")?;
+        let file = std::fs::File::open(&temporary).err_tip(|| "Executable reopen failed")?;
+        file.sync_all().err_tip(|| "Executable sync failed")?;
+        drop(file);
+        rename_fn(&temporary, variant).err_tip(|| "Executable publication failed")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // The caller still holds the executable gate; no other generation can own this temp path.
+        if let Err(err) = std::fs::remove_file(&temporary)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return (
+                Err(Error::from(err).append("Executable temporary cleanup failed")),
+                false,
             );
+        }
+    }
+    (result, true)
+}
+
+#[cfg(unix)]
+async fn remove_executable_generation(
+    context: &SharedContext,
+    digest: DigestInfo,
+    owner: &Arc<RwLock<EncodedFilePath>>,
+) {
+    // No content-path or admission gate may be held while waiting for this lock.
+    let registration = ExecutableLockRegistration::new(&context.executable_locks, digest);
+    let _guard = registration.lock().await;
+    let identity = Arc::downgrade(owner);
+    let pending_path = context
+        .pending_executables
+        .lock()
+        .expect("pending executable registry poisoned")
+        .get(&digest)
+        .filter(|item| Weak::ptr_eq(&item.owner, &identity))
+        .map(|item| item.path.clone());
+    if let Some(path) = pending_path {
+        let removed = match fs::remove_file(&path).await {
+            Ok(()) => true,
+            Err(err) if err.code == Code::NotFound => true,
+            Err(err) => {
+                context.stop_new_allocations();
+                warn!(?err, ?path, "Failed to retire executable temporary");
+                false
+            }
+        };
+        if removed {
+            let mut pending = context
+                .pending_executables
+                .lock()
+                .expect("pending executable registry poisoned");
+            if pending
+                .get(&digest)
+                .is_some_and(|item| Weak::ptr_eq(&item.owner, &identity))
+            {
+                pending.remove(&digest);
+            }
+        }
+    }
+    let matches = context
+        .executable_owners
+        .lock()
+        .expect("executable owner registry poisoned")
+        .get(&digest)
+        .is_some_and(|current| Weak::ptr_eq(current, &identity));
+    if !matches {
+        return;
+    }
+    let path = format!(
+        "{}{EXECUTABLE_DIR_SUFFIX}/{DIGEST_FOLDER}/{digest}",
+        context.content_path
+    );
+    match fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(err) if err.code == Code::NotFound => {}
+        Err(err) => {
+            context.stop_new_allocations();
+            warn!(?err, ?path, "Failed to remove executable generation");
             return;
         }
-        let from_path = encoded_file_path.get_file_path();
-        let new_key = make_temp_key(&encoded_file_path.key);
-
-        let to_path = to_full_path_from_key(&encoded_file_path.shared_context.temp_path, &new_key);
-
-        if let Err(err) = fs::rename(&from_path, &to_path).await {
-            // ENOENT from rename is ambiguous: the source may be gone, or
-            // a directory component of the destination (the temp dir) may
-            // be missing. Confirm the source is genuinely gone before
-            // treating it as benign — otherwise a removed temp dir would
-            // flip an intact content file to Temp and orphan it on disk.
-            let source_gone = err.code == Code::NotFound
-                && matches!(
-                    fs::metadata(&from_path).await,
-                    Err(meta_err) if meta_err.code == Code::NotFound
-                );
-            if source_gone {
-                // The file is already gone — typically another thread's
-                // eviction beat us, or the entry never got its file on
-                // disk. Benign here, and it dominates log volume under
-                // heavy write+evict concurrency, so keep it at `debug`.
-                // Mark the entry Temp (as a successful rename would) so a
-                // repeat unref is a no-op and drop stops claiming the
-                // content path.
-                debug!(
-                    key = ?encoded_file_path.key,
-                    "Failed to rename file (already gone, treating as benign)",
-                );
-                encoded_file_path.path_type = PathType::Temp;
-                encoded_file_path.key = new_key;
-            } else {
-                // Either a non-ENOENT failure (EACCES, EXDEV, EBUSY, …) or
-                // ENOENT with the source still present (missing temp dir).
-                // The content file is intact; leave the entry as Content.
-                warn!(
-                    key = ?encoded_file_path.key,
-                    ?from_path,
-                    ?to_path,
-                    ?err,
-                    "Failed to rename file",
-                );
-            }
-        } else {
-            debug!(
-                key = ?encoded_file_path.key,
-                ?from_path,
-                ?to_path,
-                "Renamed file (unref)",
-            );
-            encoded_file_path.path_type = PathType::Temp;
-            encoded_file_path.key = new_key;
-        }
+    }
+    let mut owners = context
+        .executable_owners
+        .lock()
+        .expect("executable owner registry poisoned");
+    if owners
+        .get(&digest)
+        .is_some_and(|current| Weak::ptr_eq(current, &identity))
+    {
+        owners.remove(&digest);
     }
 }
 
@@ -623,6 +932,7 @@ async fn add_files_to_cache<Fe: FileEntry>(
                 shared_context: shared_context.clone(),
                 path_type: PathType::Content,
                 key: key.borrow().into_owned(),
+                registered_key: Some(key.borrow().into_owned()),
             }),
         );
         let time_since_anchor = if let Ok(d) = anchor_time.duration_since(atime) {
@@ -794,8 +1104,11 @@ async fn prune_temp_path(temp_path: &str) -> Result<(), Error> {
         let mut read_dir_stream = ReadDirStream::new(dir_handle);
         while let Some(dir_entry) = read_dir_stream.next().await {
             let path = dir_entry?.path();
-            if let Err(err) = fs::remove_file(&path).await {
-                warn!(?path, ?err, "Failed to delete file",);
+            if let Err(err) = fs::remove_file(&path).await
+                && err.code != Code::NotFound
+            {
+                return Err(err)
+                    .err_tip(|| "Failed to reclaim filesystem temporary during startup");
             }
         }
         Ok(())
@@ -818,13 +1131,13 @@ pub async fn check_duplicate_files<Fe>(
 where
     Fe: FileEntry,
 {
-    let temp_file_encoded_file_path = entry.get_encoded_file_path().write().await;
     let maybe_existing_item = evicting_map.get(&key.borrow().into_owned()).await;
     if let Some(existing_item) = maybe_existing_item {
         if Arc::ptr_eq(entry, &existing_item) {
             warn!("Tried to check duplicate of an entry we already have!");
-            return Ok(true);
+            return Ok(evicting_map.contains_if(key, |current| Arc::ptr_eq(current, entry)));
         }
+        let temp_file_encoded_file_path = entry.get_encoded_file_path().write().await;
         let existing_item_encoded_file_path = existing_item.get_encoded_file_path().write().await;
         if entry.data_size() == existing_item.data_size() {
             const CHUNK_SIZE: usize = 16 * 1024; // 16kb chunks, kinda picked out of the air
@@ -887,7 +1200,9 @@ where
                 ?temp_path,
                 "Identical files, so don't need to edit, skipping emplace"
             );
-            return Ok(true);
+            return Ok(
+                evicting_map.contains_if(key, |current| Arc::ptr_eq(current, &existing_item))
+            );
         }
         trace!(
             entry_data_size = entry.data_size(),
@@ -896,69 +1211,9 @@ where
             "Different data sizes, so non-duplicate"
         );
     } else {
-        trace!(
-            temp_file = ?temp_file_encoded_file_path.get_file_path(),
-            "No existing entry, so not duplicate"
-        );
+        trace!("No existing entry, so not duplicate");
     }
     Ok(false)
-}
-
-/// Deletes a digest's `.exec` variant (see
-/// [`FilesystemStore::with_executable_hardlink_source`]) when that digest is
-/// evicted or replaced in the primary CAS `evicting_map`. Without this, the
-/// `.exec` directory is invisible to `max_bytes` and is only ever cleared by
-/// the startup `remove_dir_all`, so it grows without bound at runtime (#2474).
-/// Tying its lifetime to the primary entry instead bounds total disk use to
-/// roughly `2 * max_bytes` in the worst case (every blob also executable).
-#[cfg(unix)]
-#[derive(Debug)]
-struct ExecutableVariantRemover {
-    content_path: String,
-    executable_locks: ExecutableLocks,
-}
-
-#[cfg(unix)]
-impl RemoveItemCallback for ExecutableVariantRemover {
-    fn callback<'a>(
-        &'a self,
-        store_key: StoreKey<'a>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        let StoreKey::Digest(digest) = store_key else {
-            return Box::pin(async {});
-        };
-        let content_path = self.content_path.clone();
-        let executable_locks = Arc::clone(&self.executable_locks);
-        // Spawn before returning the callback future. Even if the operation
-        // that triggered eviction is canceled before it polls callbacks, this
-        // critical cleanup has already taken ownership of the work.
-        let task = background_spawn!("filesystem_store_remove_executable_variant", async move {
-            let registration = ExecutableLockRegistration::new(&executable_locks, digest);
-            let guard = registration.lock().await;
-            let variant_path =
-                format!("{content_path}{EXECUTABLE_DIR_SUFFIX}/{DIGEST_FOLDER}/{digest}");
-            match fs::remove_file(&variant_path).await {
-                Ok(()) => debug!(
-                    ?variant_path,
-                    "Deleted executable variant for evicted digest"
-                ),
-                // Common case: no variant was ever materialized for this digest.
-                Err(err) if err.code == Code::NotFound => {}
-                Err(err) => warn!(
-                    ?variant_path,
-                    ?err,
-                    "Failed to delete executable variant for evicted digest"
-                ),
-            }
-            drop(guard);
-            drop(registration);
-        });
-        Box::pin(async move {
-            if let Err(err) = task.await {
-                warn!(?err, "Executable-variant removal task failed");
-            }
-        })
-    }
 }
 
 #[derive(Debug, MetricsComponent)]
@@ -981,6 +1236,8 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     /// get/insert/remove the per-digest async lock — never across I/O.
     #[cfg(unix)]
     executable_locks: ExecutableLocks,
+    #[cfg(unix)]
+    executable_admissions: ExecutableLocks,
 }
 
 impl<Fe: FileEntry> FilesystemStore<Fe> {
@@ -1023,22 +1280,37 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         #[cfg(unix)]
         {
             let executable_dir = format!("{}{EXECUTABLE_DIR_SUFFIX}", spec.content_path);
-            drop(fs::remove_dir_all(&executable_dir).await);
+            match fs::remove_dir_all(&executable_dir).await {
+                Ok(()) => {}
+                Err(err) if err.code == Code::NotFound => {}
+                Err(err) => {
+                    return Err(err).err_tip(|| "Failed to clear executable storage on reopen");
+                }
+            }
             fs::create_dir_all(format!("{executable_dir}/{DIGEST_FOLDER}"))
                 .await
                 .err_tip(|| format!("Failed to create executable dir {executable_dir}"))?;
-            evicting_map.add_remove_callback(RemoveItemCallbackHolder::new(Arc::new(
-                ExecutableVariantRemover {
-                    content_path: spec.content_path.clone(),
-                    executable_locks: executable_locks.clone(),
-                },
-            )));
         }
 
         let shared_context = Arc::new(SharedContext {
             active_drop_spawns: AtomicU64::new(0),
             temp_path: spec.temp_path.clone(),
             content_path: spec.content_path.clone(),
+            content_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            content_owners: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(unix)]
+            executable_locks: Arc::clone(&executable_locks),
+            #[cfg(unix)]
+            executable_owners: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(unix)]
+            pending_executables: std::sync::Mutex::new(HashMap::new()),
+            write_admission_failed: AtomicBool::new(false),
+            #[cfg(test)]
+            retirement_observer: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            executable_reservation_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            executable_ready_pause: std::sync::Mutex::new(None),
         });
 
         let block_size = if spec.block_size == 0 {
@@ -1076,6 +1348,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             write_semaphore,
             #[cfg(unix)]
             executable_locks,
+            #[cfg(unix)]
+            executable_admissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }))
     }
 
@@ -1124,34 +1398,49 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     ) -> Result<T, Error> {
         let variant_path = self.executable_variant_path(digest);
         let mut handler = Some(handler);
-        loop {
-            let registration =
-                ExecutableLockRegistration::new(&self.executable_locks, *digest);
-            let guard = registration.lock().await;
-
-            // Re-check after taking the same lock as eviction. If eviction won
-            // the race after a creator completed, release the lock before
-            // resolving the primary entry for another creation attempt.
-            // EvictingMap::get may itself run the remove callback for a
-            // TTL-expired entry, so resolving it while holding this lock can
-            // self-deadlock.
-            if fs::metadata(&variant_path).await.is_ok() {
-                let result = handler
-                    .take()
-                    .expect("executable handler is called exactly once")(
-                    variant_path.clone(),
-                )
-                .await;
+        // Permit one generation re-resolution, including replacement after successful creation.
+        for _ in 0..2 {
+            let primary = self.get_file_entry_for_digest(digest).await?;
+            for phase in 0..2 {
+                let registration = ExecutableLockRegistration::new(&self.executable_locks, *digest);
+                let guard = registration.lock().await;
+                let current = self
+                    .evicting_map
+                    .contains_if(&(*digest).into(), |entry| Arc::ptr_eq(entry, &primary));
+                let identity = Arc::downgrade(primary.get_encoded_file_path());
+                let owned = self
+                    .shared_context
+                    .executable_owners
+                    .lock()
+                    .expect("executable owner registry poisoned")
+                    .get(digest)
+                    .is_some_and(|owner| Weak::ptr_eq(owner, &identity));
+                if current && owned && fs::metadata(&variant_path).await.is_ok() {
+                    return handler.take().expect("handler called once")(variant_path.clone())
+                        .await;
+                }
                 drop(guard);
                 drop(registration);
-                return result;
+                if !current || phase == 1 {
+                    break;
+                }
+                if self
+                    .create_executable_variant(digest, &variant_path, Arc::clone(&primary))
+                    .await?
+                    == ExecutableCreation::Superseded
+                {
+                    break;
+                }
+                #[cfg(test)]
+                wait_for_executable_pause(&self.shared_context.executable_ready_pause).await;
             }
-
-            drop(guard);
-            drop(registration);
-            self.create_executable_variant(digest, &variant_path)
-                .await?;
         }
+        // Absence keeps the existing typed client-recovery contract; a present replacement is not missing.
+        self.get_file_entry_for_digest(digest).await?;
+        Err(make_err!(
+            Code::Aborted,
+            "Cache generation changed repeatedly during executable materialization"
+        ))
     }
 
     /// Non-unix has no separate executable variant, but callers use the same
@@ -1171,104 +1460,157 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         file_entry.get_file_path_locked(handler).await
     }
 
-    /// Materializes the 0o555 executable variant for `digest` in a detached
-    /// critical task. If the caller is canceled while a blocking filesystem
-    /// operation is running, the task retains both the primary `FileEntry` pin
-    /// and the per-digest exclusion until the operation actually completes.
+    /// Reserves and materializes an executable copy in a cancellation-owned critical task.
     #[cfg(unix)]
     async fn create_executable_variant(
         &self,
         digest: &DigestInfo,
         variant_path: &OsStr,
-    ) -> Result<(), Error> {
-        // Resolve before taking the executable lock. EvictingMap::get may
-        // lazily reap an expired entry and await the remove callback, which
-        // acquires that same lock.
-        let file_entry = self
-            .get_file_entry_for_digest(digest)
-            .await
-            .err_tip(|| "Resolving CAS blob for executable variant")?;
-        let variant_owned = variant_path.to_os_string();
-        let mut temp_owned = variant_path.to_os_string();
-        temp_owned.push(".tmp");
-        let rename_fn = self.rename_fn;
-        let registration =
-            ExecutableLockRegistration::new(&self.executable_locks, *digest);
-
+        primary: Arc<Fe>,
+    ) -> Result<ExecutableCreation, Error> {
+        let store = self
+            .get_arc()
+            .ok_or_else(|| make_err!(Code::Internal, "Store is shutting down"))?;
+        let digest = *digest;
+        let variant = variant_path.to_os_string();
         background_spawn!("filesystem_store_create_executable_variant", async move {
-            // The raw task handle detaches on caller cancellation. The task
-            // itself owns the FileEntry and registration, so neither eviction
-            // guard can disappear while spawn_blocking is still running.
-            file_entry
-                .get_file_path_locked(move |src_path| async move {
-                    let guard = registration.lock().await;
-                    let result = async {
-                        // Another detached creator may have completed while we
-                        // waited. Only one task may ever use the shared `.tmp`.
-                        if fs::metadata(&variant_owned).await.is_ok() {
-                            return Ok(());
-                        }
-
-                        // All of this is blocking std::fs; run it off the async runtime.
-                        // The writable fd opened by `copy` is fully closed before the
-                        // `rename` publishes the inode, so no reachable hardlink of the
-                        // variant ever has an open writer.
-                        spawn_blocking!(
-                            "filesystem_store_executable_variant",
-                            move || -> Result<(), Error> {
-                                use std::os::unix::fs::PermissionsExt;
-                                std::fs::copy(&src_path, &temp_owned).map_err(|e| {
-                                    make_err!(
-                                        Code::Internal,
-                                        "executable-variant copy failed: {e:?}"
-                                    )
-                                })?;
-                                std::fs::set_permissions(
-                                    &temp_owned,
-                                    std::fs::Permissions::from_mode(0o555),
-                                )
-                                .map_err(|e| {
-                                    make_err!(
-                                        Code::Internal,
-                                        "executable-variant chmod 0o555 failed: {e:?}"
-                                    )
-                                })?;
-                                // Reopen read-only purely to fsync the bytes durable before publish.
-                                let f = std::fs::File::open(&temp_owned).map_err(|e| {
-                                    make_err!(
-                                        Code::Internal,
-                                        "executable-variant reopen: {e:?}"
-                                    )
-                                })?;
-                                f.sync_all().map_err(|e| {
-                                    make_err!(
-                                        Code::Internal,
-                                        "executable-variant fsync: {e:?}"
-                                    )
-                                })?;
-                                drop(f);
-                                rename_fn(temp_owned.as_os_str(), variant_owned.as_os_str())
-                                    .map_err(|e| {
-                                        make_err!(
-                                            Code::Internal,
-                                            "executable-variant rename failed: {e:?}"
-                                        )
-                                    })?;
-                                Ok(())
-                            }
+            let admission = ExecutableLockRegistration::new(&store.executable_admissions, digest);
+            let _admitted = admission.lock().await;
+            store.shared_context.check_write_admission()?;
+            let (base, weight) =
+                executable_reservation_bytes(primary.data_size(), store.block_size).ok_or_else(
+                    || {
+                        make_err!(
+                            Code::ResourceExhausted,
+                            "Executable allocation size overflow"
                         )
-                        .await
-                        .err_tip(|| "executable-variant spawn_blocking join failed")?
-                    }
-                    .await;
-                    drop(guard);
-                    drop(registration);
-                    result
+                    },
+                )?;
+            // No entry, content-path or executable gate may be held across admission callbacks.
+            let mut generation_matched = false;
+            let admitted = store
+                .evicting_map
+                .reweight_if(&digest.into(), weight, |entry| {
+                    generation_matched = Arc::ptr_eq(entry, &primary);
+                    generation_matched
                 })
-                .await
+                .await;
+            if !admitted {
+                if !generation_matched {
+                    return Ok(ExecutableCreation::Superseded);
+                }
+                return Err(make_err!(
+                    Code::ResourceExhausted,
+                    "Executable allocation cannot be admitted for the current cache generation"
+                ));
+            }
+            #[cfg(test)]
+            wait_for_executable_pause(&store.shared_context.executable_reservation_pause).await;
+            let context = Arc::clone(&store.shared_context);
+            let generation = Arc::clone(primary.get_encoded_file_path());
+            let map = Arc::clone(&store.evicting_map);
+            let expected = Arc::clone(&primary);
+            let rename_fn = store.rename_fn;
+            let outcome = primary
+                .get_file_path_locked(move |source| async move {
+                    let registration =
+                        ExecutableLockRegistration::new(&context.executable_locks, digest);
+                    let _guard = registration.lock().await;
+                    if !map.contains_if(&digest.into(), |entry| Arc::ptr_eq(entry, &expected)) {
+                        return Ok((Ok(ExecutableCreation::Superseded), true));
+                    }
+                    let identity = Arc::downgrade(&generation);
+                    let owned = context
+                        .executable_owners
+                        .lock()
+                        .expect("executable owner registry poisoned")
+                        .get(&digest)
+                        .is_some_and(|owner| Weak::ptr_eq(owner, &identity));
+                    if owned && fs::metadata(&variant).await.is_ok() {
+                        return Ok((Ok(ExecutableCreation::Ready), true));
+                    }
+                    if let Err(err) = context.check_write_admission() {
+                        return Ok((Err(err), true));
+                    }
+                    // A previous generation's path is not a cache hit, even for the same digest.
+                    if let Err(err) = fs::remove_file(&variant).await
+                        && err.code != Code::NotFound
+                    {
+                        context.stop_new_allocations();
+                        return Ok((Err(err), false));
+                    }
+                    context
+                        .executable_owners
+                        .lock()
+                        .expect("executable owner registry poisoned")
+                        .remove(&digest);
+                    let publish_path = variant.clone();
+                    let mut temporary = variant.clone();
+                    temporary.push(".tmp");
+                    context
+                        .pending_executables
+                        .lock()
+                        .expect("pending executable registry poisoned")
+                        .insert(
+                            digest,
+                            PendingExecutable {
+                                owner: identity.clone(),
+                                path: temporary,
+                            },
+                        );
+                    let copied =
+                        spawn_blocking!("filesystem_store_executable_variant", move || {
+                            copy_executable_variant(&source, &publish_path, rename_fn)
+                        })
+                        .await;
+                    let outcome = match copied {
+                        Ok((result, cleaned)) => {
+                            (result.map(|()| ExecutableCreation::Ready), cleaned)
+                        }
+                        Err(err) => (Err(Error::from(err)), false),
+                    };
+                    if outcome.1 {
+                        let mut pending = context
+                            .pending_executables
+                            .lock()
+                            .expect("pending executable registry poisoned");
+                        if pending
+                            .get(&digest)
+                            .is_some_and(|item| Weak::ptr_eq(&item.owner, &identity))
+                        {
+                            pending.remove(&digest);
+                        }
+                    } else {
+                        context.stop_new_allocations();
+                    }
+                    if outcome.0.is_ok() {
+                        context
+                            .executable_owners
+                            .lock()
+                            .expect("executable owner registry poisoned")
+                            .insert(digest, identity);
+                    }
+                    Ok(outcome)
+                })
+                .await;
+            let (result, temporary_removed) = match outcome {
+                Ok(outcome) => outcome,
+                Err(err) => (Err(err), false),
+            };
+            // Both the primary read guard and executable gate have been released here.
+            // Failed cleanup keeps the current charge and stops new allocation until reopen.
+            // Eviction may retire the entry, so the latch does not promise retained charge forever.
+            // A late rollback cannot affect a replacement generation.
+            if result.is_err() && temporary_removed {
+                store
+                    .evicting_map
+                    .reweight_if(&digest.into(), base, |entry| Arc::ptr_eq(entry, &primary))
+                    .await;
+            }
+            result
         })
         .await
-        .err_tip(|| "executable-variant critical task failed")?
+        .err_tip(|| "Executable allocation task failed")?
     }
 
     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
@@ -1286,10 +1628,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                  Callers must materialise empty files directly rather than going through get_file_entry_for_digest."
             ));
         }
-        self.evicting_map
-            .get(&digest.into())
-            .await
-            .ok_or_else(|| make_err!(Code::NotFound, "{digest} not found in filesystem store. This may indicate the file was evicted due to cache pressure. Consider increasing 'max_bytes' in your filesystem store's eviction_policy configuration."))
+        self.evicting_map.get(&digest.into()).await.ok_or_else(|| {
+            make_err!(Code::NotFound, "{digest} not found in filesystem store").with_context(
+                ErrorContext::MissingDigest {
+                    hash: digest.packed_hash().to_string(),
+                    size: digest.size_bytes() as i64,
+                },
+            )
+        })
     }
 
     async fn update_file(
@@ -1349,112 +1695,41 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     }
 
     async fn emplace_file(&self, key: StoreKey<'static>, entry: Arc<Fe>) -> Result<(), Error> {
-        // This sequence of events is quite tricky to understand due to the amount of triggers that
-        // happen, async'ness of it and the locking. So here is a breakdown of what happens:
-        // 1. Here will hold a write lock on any file operations of this FileEntry.
-        // 2. Then insert the entry into the evicting map. This may trigger an eviction of other
-        //    entries.
-        // 3. Eviction triggers `unref()`, which grabs a write lock on the evicted FileEntry
-        //    during the rename.
-        // 4. It should be impossible for items to be added while eviction is happening, so there
-        //    should not be a deadlock possibility. However, it is possible for the new FileEntry
-        //    to be evicted before the file is moved into place. Eviction of the newly inserted
-        //    item is not possible within the `insert()` call because the write lock inside the
-        //    eviction map. If an eviction of new item happens after `insert()` but before
-        //    `rename()` then we get to finish our operation because the `unref()` of the new item
-        //    will be blocked on us because we currently have the lock.
-        // 5. Move the file into place. Since we hold a write lock still anyone that gets our new
-        //    FileEntry (which has not yet been placed on disk) will not be able to read the file's
-        //    contents until we release the lock.
-        let evicting_map = self.evicting_map.clone();
+        let evicting_map = Arc::clone(&self.evicting_map);
         let rename_fn = self.rename_fn;
-
-        // We need to guarantee that this will get to the end even if the parent future is dropped.
-        // See: https://github.com/TraceMachina/nativelink/issues/495
+        // Publication and cleanup must finish even if the uploading caller is canceled.
         background_spawn!("filesystem_store_emplace_file", async move {
-            // Sometimes we get files to emplace that are identical to the existing files
-            // Due to the evict/remove/replace cycle taking some amount of time, we actually
-            // want to drop these
+            {
+                let mut path = entry.get_encoded_file_path().write().await;
+                path.registered_key = Some(key.clone());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let from = path.get_file_path().into_owned();
+                    if let Err(err) =
+                        fs::set_permissions(&from, std::fs::Permissions::from_mode(0o444)).await
+                    {
+                        warn!(?err, ?from, "Failed to set CAS blob read-only");
+                    }
+                }
+            }
             if check_duplicate_files(&evicting_map, &key, &entry).await? {
                 return Ok(());
             }
-
             evicting_map
-                .insert(key.borrow().into_owned().into(), entry.clone())
+                .insert(key.borrow().into_owned().into(), Arc::clone(&entry))
                 .await;
-
-            // The insert might have resulted in an eviction/unref so we need to check
-            // it still exists in there. But first, get the lock...
-            let mut encoded_file_path = entry.get_encoded_file_path().write().await;
-            // Then check it's still in there...
-            if evicting_map.get(&key).await.is_none() {
-                info!(%key, "Got eviction while emplacing, dropping");
-                return Ok(());
-            }
-
-            let final_path = get_file_path_raw(
-                &PathType::Content,
-                encoded_file_path.shared_context.as_ref(),
-                &key,
-            );
-
-            let from_path = encoded_file_path.get_file_path();
-
-            // Lock the blob down as read-only *before* it lands at its final
-            // content path, so every hardlink of it (the worker directory cache
-            // and `download_to_directory`) inherits an immutable, read-only
-            // inode. This is what preserves the input-tree hermeticity contract
-            // (actions cannot mutate their inputs) without a per-materialization
-            // chmod walk, and it means callers must never `chmod` a hardlinked
-            // blob — anything needing a different mode (e.g. an executable's +x
-            // bit) must take a private copy. Content-addressed blobs are
-            // write-once and replaced by `rename` rather than in-place writes,
-            // and unlink only needs the *parent directory* to be writable, so a
-            // read-only file mode is safe for both overwrite-by-rename and
-            // eviction. Best-effort: a failure here (e.g. the temp file was
-            // already evicted out from under us) must not abort the emplace.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    fs::set_permissions(&from_path, std::fs::Permissions::from_mode(0o444)).await
-                {
-                    warn!(?err, ?from_path, "Failed to set CAS blob read-only");
-                }
-            }
-            // Internally tokio spawns fs commands onto a blocking thread anyways.
-            // Since we are already on a blocking thread, we just need the `fs` wrapper to manage
-            // an open-file permit (ensure we don't open too many files at once).
-            let result = (rename_fn)(&from_path, &final_path).err_tip(|| {
-                format!(
-                    "Failed to rename temp file to final path {}",
-                    final_path.display()
-                )
-            });
-
-            // In the event our move from temp file to final file fails we need to ensure we remove
-            // the entry from our map.
-            // Remember: At this point it is possible for another thread to have a reference to
-            // `entry`, so we can't delete the file, only drop() should ever delete files.
-            if let Err(err) = result {
-                error!(?err, ?from_path, ?final_path, "Failed to rename file",);
-                // Warning: To prevent deadlock we need to release our lock or during `remove_if()`
-                // it will call `unref()`, which triggers a write-lock on `encoded_file_path`.
-                drop(encoded_file_path);
-                // It is possible that the item in our map is no longer the item we inserted,
-                // So, we need to conditionally remove it only if the pointers are the same.
-
+            let result = publish_file_generation(&evicting_map, &key, &entry, rename_fn).await;
+            if result.is_err() {
+                // publish_file_generation has released every path gate before cleanup callbacks.
                 evicting_map
-                    .remove_if(&key, |map_entry| Arc::<Fe>::ptr_eq(map_entry, &entry))
+                    .remove_if(&key, |current| Arc::ptr_eq(current, &entry))
                     .await;
-                return Err(err);
             }
-            encoded_file_path.path_type = PathType::Content;
-            encoded_file_path.key = key;
-            Ok(())
+            result
         })
         .await
-        .err_tip(|| "Failed to create spawn in filesystem store update_file")?
+        .err_tip(|| "Failed to join filesystem store publication")?
     }
 
     pub fn get_eviction_snapshot(&self) -> EvictionSnapshot {
@@ -1471,12 +1746,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         &self,
         temp_key: StoreKey<'static>,
     ) -> Result<(Fe, FileSlot, OsString), Error> {
+        self.shared_context.check_write_admission()?;
         Fe::make_and_open_file(
             self.block_size,
             EncodedFilePath {
                 shared_context: self.shared_context.clone(),
                 path_type: PathType::Temp,
                 key: temp_key,
+                registered_key: None,
             },
         )
         .await
@@ -1626,6 +1903,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             // don't need to add, because zero length files are just assumed to exist
             return Ok((0, None));
         }
+        self.shared_context.check_write_admission()?;
         let entry = Fe::create(
             file_size,
             self.block_size,
@@ -1633,6 +1911,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
                 shared_context: self.shared_context.clone(),
                 path_type: PathType::Custom(path),
                 key: key.borrow().into_owned(),
+                registered_key: Some(key.borrow().into_owned()),
             }),
         );
         // We are done with the file, if we hold a reference to the file here, it could
@@ -1671,6 +1950,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             )
         })?;
         let read_limit = length.unwrap_or(u64::MAX);
+        let failed_entry = Arc::clone(&entry);
         let mut temp_file = entry.read_file_part(offset, read_limit).or_else(|err| async move {
             // If the file is not found, we need to remove it from the eviction map.
             if err.code == Code::NotFound {
@@ -1683,7 +1963,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
                     key = ?owned_key,
                     "Filesystem store map/disk divergence: removing entry; reader will fall through to slow store",
                 );
-                self.evicting_map.remove(&owned_key).await;
+                self.evicting_map.remove_if(&owned_key, |current| Arc::ptr_eq(current, &failed_entry)).await;
             }
             Err(err)
         }).await?;
@@ -1748,6 +2028,9 @@ impl<Fe: FileEntry> HealthStatusIndicator for FilesystemStore<Fe> {
     /// indicator.
     async fn check_health(&self, _namespace: Cow<'static, str>) -> HealthStatus {
         const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+        if let Err(err) = self.shared_context.check_write_admission() {
+            return HealthStatus::new_failed(self, err.message_string().into());
+        }
 
         let content_path = &self.shared_context.content_path;
         let stat = tokio::fs::metadata(&content_path);
@@ -1784,5 +2067,1004 @@ impl<Fe: FileEntry> HealthStatusIndicator for FilesystemStore<Fe> {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod generation_tests {
+    use super::*;
+    use futures::{FutureExt, poll};
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::common::make_temp_path;
+    use nativelink_util::store_trait::StoreLike;
+    use tokio::sync::oneshot;
+
+    enum CleanupFailure {
+        Primary,
+        Executable,
+        StaleExecutable,
+        PendingExecutable,
+        RetiredTemporary,
+    }
+
+    async fn check_cleanup_failure(failure: CleanupFailure) -> Result<(), Error> {
+        timeout(Duration::from_secs(5), async {
+            let spec = FilesystemSpec {
+                content_path: make_temp_path("content"),
+                temp_path: make_temp_path("temp"),
+                block_size: 1,
+                ..Default::default()
+            };
+            let store = FilesystemStore::<FileEntryImpl>::new(&spec).await?;
+            let removed = DigestInfo::new([1; 32], 10);
+            let cached = DigestInfo::new([2; 32], 10);
+            let fresh = DigestInfo::new([3; 32], 10);
+            for digest in [removed, cached] {
+                store
+                    .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                    .await?;
+                if digest == cached || !matches!(failure, CleanupFailure::StaleExecutable) {
+                    store
+                        .with_executable_hardlink_source(&digest, |_| async { Ok(()) })
+                        .await?;
+                }
+            }
+            let primary = store.get_file_entry_for_digest(&removed).await?;
+            let variant = format!("{}.exec/{DIGEST_FOLDER}/{removed}", spec.content_path);
+            match failure {
+                CleanupFailure::Primary => {
+                    // A missing destination directory is not a vanished source.
+                    tokio::fs::remove_dir_all(format!("{}/{DIGEST_FOLDER}", spec.temp_path))
+                        .await?;
+                }
+                CleanupFailure::Executable => {
+                    tokio::fs::remove_file(&variant).await?;
+                    tokio::fs::create_dir(&variant).await?;
+                }
+                CleanupFailure::StaleExecutable => {
+                    // A pre-existing variant with no owning primary generation must be removed.
+                    tokio::fs::create_dir(&variant).await?;
+                }
+                CleanupFailure::PendingExecutable => {
+                    let temporary = OsString::from(format!("{variant}.tmp"));
+                    tokio::fs::create_dir(&temporary).await?;
+                    store
+                        .shared_context
+                        .pending_executables
+                        .lock()
+                        .unwrap()
+                        .insert(
+                            removed,
+                            PendingExecutable {
+                                owner: Arc::downgrade(primary.get_encoded_file_path()),
+                                path: temporary,
+                            },
+                        );
+                }
+                CleanupFailure::RetiredTemporary => {}
+            }
+            assert!(
+                !store
+                    .shared_context
+                    .write_admission_failed
+                    .load(Ordering::Acquire)
+            );
+            if matches!(failure, CleanupFailure::StaleExecutable) {
+                store
+                    .with_executable_hardlink_source(&removed, |_| async { Ok(()) })
+                    .await
+                    .expect_err("stale executable cleanup fails");
+                assert!(
+                    store
+                        .shared_context
+                        .write_admission_failed
+                        .load(Ordering::Acquire)
+                );
+            }
+            assert!(
+                store
+                    .get_evicting_map()
+                    .remove(&StoreKey::Digest(removed))
+                    .await
+            );
+            let mut failed_temporary = None;
+            if matches!(failure, CleanupFailure::RetiredTemporary) {
+                // The reader pins the retired inode until this actual final Drop.
+                assert!(
+                    !store
+                        .shared_context
+                        .write_admission_failed
+                        .load(Ordering::Acquire)
+                );
+                let retired = primary
+                    .get_encoded_file_path()
+                    .read()
+                    .await
+                    .get_file_path()
+                    .into_owned();
+                tokio::fs::remove_file(&retired).await?;
+                tokio::fs::create_dir(&retired).await?;
+                failed_temporary = Some(retired);
+                drop(primary);
+                // Drop increments this counter synchronously before scheduling deletion.
+                while store
+                    .shared_context
+                    .active_drop_spawns
+                    .load(Ordering::Acquire)
+                    != 0
+                    || !store
+                        .shared_context
+                        .write_admission_failed
+                        .load(Ordering::Acquire)
+                {
+                    tokio::task::yield_now().await;
+                }
+            }
+            assert!(
+                store
+                    .shared_context
+                    .write_admission_failed
+                    .load(Ordering::Acquire)
+            );
+            assert_eq!(store.has(removed).await?, None);
+            assert_eq!(
+                store
+                    .update_oneshot(fresh, Bytes::from_static(b"0123456789"))
+                    .await
+                    .unwrap_err()
+                    .code,
+                Code::ResourceExhausted
+            );
+            assert_eq!(
+                store.get_part_unchunked(cached, 0, None).await?,
+                Bytes::from_static(b"0123456789")
+            );
+            store
+                .with_executable_hardlink_source(&cached, |path| async move {
+                    assert_eq!(tokio::fs::read(path).await?, b"0123456789");
+                    Ok(())
+                })
+                .await?;
+            assert!(matches!(
+                HealthStatusIndicator::check_health(&*store, Cow::Borrowed("test")).await,
+                HealthStatus::Failed { .. }
+            ));
+            if let Some(path) = failed_temporary {
+                drop(store);
+                let error = FilesystemStore::<FileEntryImpl>::new(&spec)
+                    .await
+                    .err()
+                    .expect("reopen must reject an unreclaimed owned temporary");
+                assert!(error.messages.iter().any(|message| {
+                    message.contains("Failed to reclaim filesystem temporary during startup")
+                }));
+                assert!(tokio::fs::metadata(&path).await?.is_dir());
+                // Simulate explicit recovery of only this fixture's failed allocation.
+                tokio::fs::remove_dir(&path).await?;
+                let reopened = FilesystemStore::<FileEntryImpl>::new(&spec).await?;
+                reopened
+                    .update_oneshot(fresh, Bytes::from_static(b"0123456789"))
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .err_tip(|| "retirement failure control did not complete")?
+    }
+
+    #[nativelink_test]
+    async fn failed_primary_retirement_stops_new_allocations() -> Result<(), Error> {
+        check_cleanup_failure(CleanupFailure::Primary).await
+    }
+
+    #[nativelink_test]
+    async fn failed_executable_retirement_stops_new_allocations() -> Result<(), Error> {
+        check_cleanup_failure(CleanupFailure::Executable).await
+    }
+
+    #[nativelink_test]
+    async fn failed_stale_executable_cleanup_stops_new_allocations() -> Result<(), Error> {
+        check_cleanup_failure(CleanupFailure::StaleExecutable).await
+    }
+
+    #[nativelink_test]
+    async fn failed_pending_executable_retirement_stops_new_allocations() -> Result<(), Error> {
+        check_cleanup_failure(CleanupFailure::PendingExecutable).await
+    }
+
+    #[nativelink_test]
+    async fn failed_retired_temporary_deletion_stops_new_allocations() -> Result<(), Error> {
+        check_cleanup_failure(CleanupFailure::RetiredTemporary).await
+    }
+
+    #[nativelink_test]
+    async fn canceled_removal_finishes_its_owned_primary_and_executable_cleanup()
+    -> Result<(), Error> {
+        timeout(Duration::from_secs(5), async {
+            let content = make_temp_path("content");
+            let digest = DigestInfo::new([1; 32], 10);
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path: content.clone(),
+                temp_path: make_temp_path("temp"),
+                ..Default::default()
+            })
+            .await?;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                .await?;
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let handler_store = Arc::clone(&store);
+            let handler = tokio::spawn(async move {
+                handler_store
+                    .with_executable_hardlink_source(&digest, |path| async move {
+                        let _ = entered_tx.send(());
+                        release_rx
+                            .await
+                            .map_err(|_| make_err!(Code::Internal, "handler release dropped"))?;
+                        fs::metadata(path).await?;
+                        Ok(())
+                    })
+                    .await
+            });
+            entered_rx
+                .await
+                .map_err(|_| make_err!(Code::Internal, "handler did not enter"))?;
+            let (done_tx, done_rx) = oneshot::channel();
+            *store.shared_context.retirement_observer.lock().unwrap() = Some(done_tx);
+            let map = store.get_evicting_map();
+            let key = StoreKey::Digest(digest);
+            let mut removal = map.remove(&key).boxed();
+            assert!(poll!(removal.as_mut()).is_pending());
+            assert!(
+                !map.contains_if(&key, |_| true),
+                "removal and hook dispatch precede cancellation"
+            );
+            drop(removal);
+            let _ = release_tx.send(());
+            handler.await.err_tip(|| "handler task failed")??;
+            timeout(Duration::from_secs(5), done_rx)
+                .await
+                .err_tip(|| "owned retirement did not finish")?
+                .map_err(|_| make_err!(Code::Internal, "retirement observer dropped"))?;
+            assert_eq!(
+                fs::metadata(format!("{content}/{DIGEST_FOLDER}/{digest}"))
+                    .await
+                    .unwrap_err()
+                    .code,
+                Code::NotFound
+            );
+            assert_eq!(
+                fs::metadata(store.executable_variant_path(&digest))
+                    .await
+                    .unwrap_err()
+                    .code,
+                Code::NotFound
+            );
+            assert!(
+                store
+                    .shared_context
+                    .content_owners
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .shared_context
+                    .executable_owners
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .shared_context
+                    .pending_executables
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .err_tip(|| "generation control did not complete")?
+    }
+
+    #[nativelink_test]
+    async fn late_generation_cleanup_preserves_replacement_executable_and_temporary()
+    -> Result<(), Error> {
+        timeout(Duration::from_secs(5), async {
+            let digest = DigestInfo::new([2; 32], 10);
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path: make_temp_path("content"),
+                temp_path: make_temp_path("temp"),
+                block_size: 1,
+                ..Default::default()
+            })
+            .await?;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                .await?;
+            let old = store.get_file_entry_for_digest(&digest).await?;
+            store
+                .with_executable_hardlink_source(&digest, |_| async { Ok(()) })
+                .await?;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"9876543210"))
+                .await?;
+            let variant = store.executable_variant_path(&digest);
+            // Recreate the delayed old callback's still-present variant using its actual generation.
+            tokio::fs::write(&variant, b"0123456789").await?;
+            store
+                .shared_context
+                .executable_owners
+                .lock()
+                .unwrap()
+                .insert(digest, Arc::downgrade(old.get_encoded_file_path()));
+            store
+                .with_executable_hardlink_source(&digest, |path| async move {
+                    assert_eq!(tokio::fs::read(path).await?, b"9876543210");
+                    Ok(())
+                })
+                .await?;
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 20 of unlimited")
+            );
+            let current = store.get_file_entry_for_digest(&digest).await?;
+            let mut temporary = variant.clone();
+            temporary.push(".tmp");
+            tokio::fs::write(&temporary, b"replacement temporary").await?;
+            store
+                .shared_context
+                .pending_executables
+                .lock()
+                .unwrap()
+                .insert(
+                    digest,
+                    PendingExecutable {
+                        owner: Arc::downgrade(current.get_encoded_file_path()),
+                        path: temporary.clone(),
+                    },
+                );
+            remove_executable_generation(
+                &store.shared_context,
+                digest,
+                old.get_encoded_file_path(),
+            )
+            .await;
+            assert_eq!(tokio::fs::read(&variant).await?, b"9876543210");
+            assert_eq!(tokio::fs::read(&temporary).await?, b"replacement temporary");
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 20 of unlimited")
+            );
+            let mut original = Vec::new();
+            old.read_file_part(0, u64::MAX)
+                .await?
+                .read_to_end(&mut original)
+                .await?;
+            assert_eq!(original, b"0123456789");
+            store
+                .get_evicting_map()
+                .remove(&StoreKey::Digest(digest))
+                .await;
+            assert_eq!(
+                fs::metadata(&temporary).await.unwrap_err().code,
+                Code::NotFound
+            );
+            assert!(
+                store
+                    .shared_context
+                    .executable_owners
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .shared_context
+                    .pending_executables
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .err_tip(|| "generation control did not complete")?
+    }
+
+    #[nativelink_test]
+    async fn weak_owner_registry_releases_last_owner_without_erasing_a_replacement()
+    -> Result<(), Error> {
+        timeout(Duration::from_secs(5), async {
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path: make_temp_path("content"),
+                temp_path: make_temp_path("temp"),
+                ..Default::default()
+            })
+            .await?;
+            let key = StoreKey::Digest(DigestInfo::new([4; 32], 10));
+            let make_owner = || {
+                Arc::new(RwLock::new(EncodedFilePath {
+                    shared_context: Arc::clone(&store.shared_context),
+                    path_type: PathType::Content,
+                    key: key.clone(),
+                    registered_key: Some(key.clone()),
+                }))
+            };
+            let first = make_owner();
+            store
+                .shared_context
+                .content_owners
+                .lock()
+                .unwrap()
+                .insert(key.clone(), Arc::downgrade(&first));
+            let lookup = current_content_owner(&store.shared_context, &key).unwrap();
+            drop(first);
+            let replacement = make_owner();
+            store
+                .shared_context
+                .content_owners
+                .lock()
+                .unwrap()
+                .insert(key.clone(), Arc::downgrade(&replacement));
+            drop(lookup);
+            let observed = current_content_owner(&store.shared_context, &key).unwrap();
+            assert!(Arc::ptr_eq(&observed, &replacement));
+            drop(observed);
+            drop(replacement);
+            assert!(
+                store
+                    .shared_context
+                    .content_owners
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .shared_context
+                    .content_locks
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .err_tip(|| "generation control did not complete")?
+    }
+
+    #[test]
+    fn executable_reservation_rejects_rounding_and_total_overflow() {
+        assert_eq!(executable_reservation_bytes(1, 4096), Some((4096, 8192)));
+        assert_eq!(
+            executable_reservation_bytes(4097, 4096),
+            Some((8192, 16384))
+        );
+        assert_eq!(executable_reservation_bytes(u64::MAX, 1), None);
+        assert_eq!(executable_reservation_bytes(u64::MAX, 4096), None);
+        assert_eq!(executable_reservation_bytes(1, u64::MAX), None);
+        assert_eq!(executable_reservation_bytes(1, 0), None);
+    }
+
+    #[derive(Debug)]
+    struct RemovalSignal {
+        digest: DigestInfo,
+        sender: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl RemoveItemCallback for RemovalSignal {
+        fn callback<'a>(
+            &'a self,
+            key: StoreKey<'a>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            if key == StoreKey::Digest(self.digest) {
+                if let Some(sender) = self.sender.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+            }
+            Box::pin(async {})
+        }
+    }
+
+    struct CopyGate {
+        entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        released: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    struct ReleaseCopyGate {
+        gate: Arc<CopyGate>,
+        slot: &'static std::sync::Mutex<Option<Arc<CopyGate>>>,
+    }
+
+    impl Drop for ReleaseCopyGate {
+        fn drop(&mut self) {
+            self.slot.lock().unwrap().take();
+            *self.gate.released.lock().unwrap() = true;
+            self.gate.changed.notify_all();
+        }
+    }
+
+    #[nativelink_test(flavor = "multi_thread")]
+    async fn canceled_copy_rollback_cannot_change_a_replacement_charge() -> Result<(), Error> {
+        static GATE: std::sync::Mutex<Option<Arc<CopyGate>>> = std::sync::Mutex::new(None);
+        timeout(Duration::from_secs(5), async {
+            let digest = DigestInfo::new([5; 32], 10);
+            let other = DigestInfo::new([6; 32], 10);
+            let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+                &FilesystemSpec {
+                    content_path: make_temp_path("content"),
+                    temp_path: make_temp_path("temp"),
+                    block_size: 1,
+                    eviction_policy: Some(nativelink_config::stores::EvictionPolicy {
+                        max_count: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                |from, to| {
+                    if to.to_string_lossy().contains(".exec/") {
+                        let gate = GATE.lock().unwrap().take();
+                        if let Some(gate) = gate {
+                            if let Some(sender) = gate.entered.lock().unwrap().take() {
+                                let _ = sender.send(());
+                            }
+                            let mut released = gate.released.lock().unwrap();
+                            while !*released {
+                                released = gate.changed.wait(released).unwrap();
+                            }
+                            return Err(std::io::Error::other(
+                                "injected executable publication failure",
+                            ));
+                        }
+                    }
+                    std::fs::rename(from, to)
+                },
+            )
+            .await?;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                .await?;
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let gate = Arc::new(CopyGate {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                released: std::sync::Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+            });
+            *GATE.lock().unwrap() = Some(Arc::clone(&gate));
+            let release = ReleaseCopyGate { gate, slot: &GATE };
+            let creator_store = Arc::clone(&store);
+            let creator = tokio::spawn(async move {
+                creator_store
+                    .with_executable_hardlink_source(&digest, |_| async { Ok(()) })
+                    .await
+            });
+            entered_rx
+                .await
+                .map_err(|_| make_err!(Code::Internal, "copy did not reach publication"))?;
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 20 of unlimited")
+            );
+
+            let (old_removed_tx, old_removed_rx) = oneshot::channel();
+            Arc::clone(&store).register_remove_callback(Arc::new(RemovalSignal {
+                digest,
+                sender: std::sync::Mutex::new(Some(old_removed_tx)),
+            }))?;
+            let evict_store = Arc::clone(&store);
+            let eviction = tokio::spawn(async move {
+                evict_store
+                    .update_oneshot(other, Bytes::from_static(b"abcdefghij"))
+                    .await
+            });
+            old_removed_rx
+                .await
+                .map_err(|_| make_err!(Code::Internal, "old map generation not removed"))?;
+            let (replacement_tx, replacement_rx) = oneshot::channel();
+            Arc::clone(&store).register_remove_callback(Arc::new(RemovalSignal {
+                digest: other,
+                sender: std::sync::Mutex::new(Some(replacement_tx)),
+            }))?;
+            let replacement_store = Arc::clone(&store);
+            let replacement = tokio::spawn(async move {
+                replacement_store
+                    .update_oneshot(digest, Bytes::from_static(b"replacement bytes"))
+                    .await
+            });
+            replacement_rx
+                .await
+                .map_err(|_| make_err!(Code::Internal, "replacement not admitted"))?;
+            creator.abort();
+            assert!(creator.await.unwrap_err().is_cancelled());
+            drop(release);
+            // Acquiring admission proves the detached creator finished its failed-copy rollback.
+            let admission = ExecutableLockRegistration::new(&store.executable_admissions, digest);
+            let admitted = admission.lock().await;
+            drop(admitted);
+            drop(admission);
+            replacement.await.err_tip(|| "replacement task failed")??;
+            eviction.await.err_tip(|| "eviction task failed")??;
+            assert_eq!(store.has(digest).await?, Some(17));
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 17 of unlimited")
+            );
+            store
+                .with_executable_hardlink_source(&digest, |path| async move {
+                    assert_eq!(tokio::fs::read(path).await?, b"replacement bytes");
+                    Ok(())
+                })
+                .await?;
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 34 of unlimited")
+            );
+            assert!(
+                store
+                    .shared_context
+                    .pending_executables
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .err_tip(|| "copy supersession did not complete")?
+    }
+
+    fn arm_executable_pause(
+        slot: &std::sync::Mutex<Option<ExecutablePause>>,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        assert!(
+            slot.lock()
+                .unwrap()
+                .replace((entered_tx, resume_rx))
+                .is_none()
+        );
+        (entered_rx, resume_tx)
+    }
+
+    async fn pause_entered(receiver: oneshot::Receiver<()>) -> Result<(), Error> {
+        receiver
+            .await
+            .map_err(|_| make_err!(Code::Internal, "executable pause was not reached"))
+    }
+
+    fn assert_missing_execute_status(error: Error, digest: DigestInfo) {
+        use nativelink_proto::google::rpc::PreconditionFailure;
+        use nativelink_util::action_messages::{ActionResult, to_execute_response};
+        use prost::Message;
+        assert_eq!(error.code, Code::NotFound);
+        let response = to_execute_response(ActionResult {
+            error: Some(error),
+            ..Default::default()
+        });
+        let status = response.status.unwrap();
+        assert_eq!(status.code, Code::FailedPrecondition as i32);
+        assert_eq!(status.details.len(), 1);
+        let details = PreconditionFailure::decode(status.details[0].value.as_slice()).unwrap();
+        assert_eq!(details.violations.len(), 1);
+        assert_eq!(details.violations[0].r#type, "MISSING");
+        assert_eq!(
+            details.violations[0].subject,
+            format!("blobs/{}/{}", digest.packed_hash(), digest.size_bytes())
+        );
+    }
+
+    #[nativelink_test]
+    async fn eviction_after_reservation_preserves_missing_blob_recovery() -> Result<(), Error> {
+        timeout(Duration::from_secs(5), async {
+            let digest = DigestInfo::new([7; 32], 10);
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path: make_temp_path("content"),
+                temp_path: make_temp_path("temp"),
+                block_size: 1,
+                ..Default::default()
+            })
+            .await?;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                .await?;
+            let (entered, resume) =
+                arm_executable_pause(&store.shared_context.executable_reservation_pause);
+            let materializing = Arc::clone(&store);
+            let task = tokio::spawn(async move {
+                materializing
+                    .with_executable_hardlink_source(&digest, |_| async { Ok(()) })
+                    .await
+            });
+            pause_entered(entered).await?;
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 20 of unlimited")
+            );
+            store
+                .get_evicting_map()
+                .remove(&StoreKey::Digest(digest))
+                .await;
+            let _ = resume.send(());
+            let error = task
+                .await
+                .err_tip(|| "materialization task failed")?
+                .expect_err("evicted input is missing");
+            assert_missing_execute_status(error, digest);
+            assert!(
+                store
+                    .shared_context
+                    .pending_executables
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .err_tip(|| "post-reservation missing recovery did not finish")?
+    }
+
+    #[nativelink_test]
+    async fn replacement_after_reservation_is_resolved_once_without_false_missing()
+    -> Result<(), Error> {
+        timeout(Duration::from_secs(5), async {
+            let digest = DigestInfo::new([8; 32], 10);
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path: make_temp_path("content"),
+                temp_path: make_temp_path("temp"),
+                block_size: 1,
+                ..Default::default()
+            })
+            .await?;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                .await?;
+            let (entered, resume) =
+                arm_executable_pause(&store.shared_context.executable_reservation_pause);
+            let materializing = Arc::clone(&store);
+            let task = tokio::spawn(async move {
+                materializing
+                    .with_executable_hardlink_source(&digest, |path| async move {
+                        Ok(tokio::fs::read(path).await?)
+                    })
+                    .await
+            });
+            pause_entered(entered).await?;
+            store
+                .get_evicting_map()
+                .remove(&StoreKey::Digest(digest))
+                .await;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"replacement bytes"))
+                .await?;
+            let _ = resume.send(());
+            assert_eq!(
+                task.await.err_tip(|| "materialization task failed")??,
+                b"replacement bytes"
+            );
+            assert_eq!(store.has(digest).await?, Some(17));
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 34 of unlimited")
+            );
+            Ok(())
+        })
+        .await
+        .err_tip(|| "post-reservation replacement did not finish")?
+    }
+
+    #[nativelink_test]
+    async fn repeated_replacement_after_ready_is_bounded_without_false_missing() -> Result<(), Error>
+    {
+        timeout(Duration::from_secs(5), async {
+            let digest = DigestInfo::new([9; 32], 10);
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path: make_temp_path("content"),
+                temp_path: make_temp_path("temp"),
+                block_size: 1,
+                ..Default::default()
+            })
+            .await?;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                .await?;
+            let calls = Arc::new(AtomicU64::new(0));
+            let handler_calls = Arc::clone(&calls);
+            let (first_entered, first_resume) =
+                arm_executable_pause(&store.shared_context.executable_ready_pause);
+            let materializing = Arc::clone(&store);
+            let task = tokio::spawn(async move {
+                materializing
+                    .with_executable_hardlink_source(&digest, |_| async move {
+                        handler_calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    })
+                    .await
+            });
+            pause_entered(first_entered).await?;
+            store
+                .get_evicting_map()
+                .remove(&StoreKey::Digest(digest))
+                .await;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"abcdefghij"))
+                .await?;
+            let (second_entered, second_resume) =
+                arm_executable_pause(&store.shared_context.executable_ready_pause);
+            let _ = first_resume.send(());
+            pause_entered(second_entered).await?;
+            store
+                .get_evicting_map()
+                .remove(&StoreKey::Digest(digest))
+                .await;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"ABCDEFGHIJ"))
+                .await?;
+            let _ = second_resume.send(());
+            let error = task
+                .await
+                .err_tip(|| "materialization task failed")?
+                .expect_err("two replaced generations exhaust this public call");
+            assert_eq!(error.code, Code::Aborted);
+            assert_eq!(error.context, ErrorContext::None);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                store.get_part_unchunked(digest, 0, None).await?,
+                Bytes::from_static(b"ABCDEFGHIJ")
+            );
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 10 of unlimited")
+            );
+            Ok(())
+        })
+        .await
+        .err_tip(|| "post-ready generation churn was not bounded")?
+    }
+
+    #[nativelink_test]
+    async fn canceled_caller_after_reservation_keeps_owned_allocation_completion()
+    -> Result<(), Error> {
+        timeout(Duration::from_secs(5), async {
+            let digest = DigestInfo::new([10; 32], 10);
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path: make_temp_path("content"),
+                temp_path: make_temp_path("temp"),
+                block_size: 1,
+                ..Default::default()
+            })
+            .await?;
+            store
+                .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                .await?;
+            let (entered, resume) =
+                arm_executable_pause(&store.shared_context.executable_reservation_pause);
+            let materializing = Arc::clone(&store);
+            let task = tokio::spawn(async move {
+                materializing
+                    .with_executable_hardlink_source(&digest, |_| async { Ok(()) })
+                    .await
+            });
+            pause_entered(entered).await?;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 20 of unlimited")
+            );
+            let _ = resume.send(());
+            let admission = ExecutableLockRegistration::new(&store.executable_admissions, digest);
+            let admitted = admission.lock().await;
+            drop(admitted);
+            drop(admission);
+            assert_eq!(
+                fs::metadata(store.executable_variant_path(&digest))
+                    .await?
+                    .len(),
+                10
+            );
+            assert!(
+                store
+                    .shared_context
+                    .pending_executables
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            store
+                .get_evicting_map()
+                .remove(&StoreKey::Digest(digest))
+                .await;
+            assert!(
+                store
+                    .get_eviction_snapshot()
+                    .to_string()
+                    .starts_with("Bytes: 0 of unlimited")
+            );
+            Ok(())
+        })
+        .await
+        .err_tip(|| "canceled reservation owner did not finish")?
+    }
+
+    #[nativelink_test]
+    async fn unmatched_reservation_is_superseded_not_capacity_failure() -> Result<(), Error> {
+        timeout(Duration::from_secs(5), async {
+            for replace in [false, true] {
+                let digest = DigestInfo::new([11; 32], 10);
+                let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                    content_path: make_temp_path("content"),
+                    temp_path: make_temp_path("temp"),
+                    block_size: 1,
+                    ..Default::default()
+                })
+                .await?;
+                store
+                    .update_oneshot(digest, Bytes::from_static(b"0123456789"))
+                    .await?;
+                let primary = store.get_file_entry_for_digest(&digest).await?;
+                let admission =
+                    ExecutableLockRegistration::new(&store.executable_admissions, digest);
+                let admitted = admission.lock().await;
+                let creating = Arc::clone(&store);
+                let task = tokio::spawn(async move {
+                    let path = creating.executable_variant_path(&digest);
+                    creating
+                        .create_executable_variant(&digest, &path, primary)
+                        .await
+                });
+                store
+                    .get_evicting_map()
+                    .remove(&StoreKey::Digest(digest))
+                    .await;
+                if replace {
+                    store
+                        .update_oneshot(digest, Bytes::from_static(b"replacement bytes"))
+                        .await?;
+                }
+                drop(admitted);
+                drop(admission);
+                assert_eq!(
+                    task.await.err_tip(|| "creation task failed")??,
+                    ExecutableCreation::Superseded
+                );
+                assert_eq!(store.has(digest).await?, replace.then_some(17));
+                assert_eq!(
+                    fs::metadata(store.executable_variant_path(&digest))
+                        .await
+                        .unwrap_err()
+                        .code,
+                    Code::NotFound
+                );
+            }
+            Ok(())
+        })
+        .await
+        .err_tip(|| "unmatched reservation did not finish")?
     }
 }

@@ -19,20 +19,19 @@ use core::time::Duration;
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::SystemTime;
 
 use async_lock::RwLock;
 use bytes::Bytes;
-use futures::executor::block_on;
 use futures::task::Poll;
 use futures::{Future, FutureExt, poll};
 use nativelink_config::stores::{EvictionPolicy, FilesystemSpec};
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_store::filesystem_store::{
-    DIGEST_FOLDER, EncodedFilePath, FileEntry, FileEntryImpl, FileType, FilesystemStore,
-    STR_FOLDER, check_duplicate_files, key_from_file, make_temp_key,
+    DIGEST_FOLDER, EncodedFilePath, FileEntry, FileEntryImpl, FilesystemStore, STR_FOLDER,
+    check_duplicate_files, make_temp_key,
 };
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs, make_temp_path};
@@ -128,7 +127,7 @@ impl<Hooks: FileEntryHooks + 'static + Sync + Send> FileEntry for TestFileEntry<
         self.inner.as_ref().unwrap().size_on_disk()
     }
 
-    fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath> {
+    fn get_encoded_file_path(&self) -> &Arc<RwLock<EncodedFilePath>> {
         self.inner.as_ref().unwrap().get_encoded_file_path()
     }
 
@@ -163,6 +162,10 @@ impl<Hooks: FileEntryHooks + 'static + Sync + Send> LenEntry for TestFileEntry<H
 
     fn is_empty(&self) -> bool {
         self.inner.as_ref().unwrap().is_empty()
+    }
+
+    fn on_remove(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.inner.as_ref().unwrap().on_remove()
     }
 
     async fn unref(&self) {
@@ -641,26 +644,19 @@ async fn eviction_on_insert_calls_unref_once() -> Result<(), Error> {
     const SMALL_VALUE: &str = "01";
     const BIG_VALUE: &str = "0123";
 
-    static UNREFED_DIGESTS: LazyLock<Mutex<Vec<StoreKey<'static>>>> =
+    static UNREFED_OWNERS: LazyLock<Mutex<Vec<Weak<RwLock<EncodedFilePath>>>>> =
         LazyLock::new(|| Mutex::new(Vec::new()));
     struct LocalHooks {}
     impl FileEntryHooks for LocalHooks {
         fn on_unref<Fe: FileEntry>(file_entry: &Fe) {
-            block_on(file_entry.get_file_path_locked(move |path_str| async move {
-                let path = Path::new(&path_str);
-                let digest = key_from_file(
-                    path.file_name().unwrap().to_str().unwrap(),
-                    FileType::Digest,
-                )
-                .unwrap();
-                UNREFED_DIGESTS.lock().push(digest.borrow().into_owned());
-                Ok(())
-            }))
-            .unwrap();
+            // Retirement may already have renamed this generation's pathname.
+            UNREFED_OWNERS
+                .lock()
+                .push(Arc::downgrade(file_entry.get_encoded_file_path()));
         }
     }
 
-    let small_digest = StoreKey::Digest(DigestInfo::try_new(HASH1, SMALL_VALUE.len())?);
+    let small_digest = DigestInfo::try_new(HASH1, SMALL_VALUE.len())?;
     let big_digest = DigestInfo::try_new(HASH1, BIG_VALUE.len())?;
 
     let store = Box::pin(
@@ -678,19 +674,20 @@ async fn eviction_on_insert_calls_unref_once() -> Result<(), Error> {
     );
     // Insert data into store.
     store
-        .update_oneshot(small_digest.borrow(), SMALL_VALUE.into())
+        .update_oneshot(small_digest, SMALL_VALUE.into())
         .await?;
+    let small_entry = store.get_file_entry_for_digest(&small_digest).await?;
+    let small_owner = Arc::downgrade(small_entry.get_encoded_file_path());
     store.update_oneshot(big_digest, BIG_VALUE.into()).await?;
 
     {
         // Our first digest should have been unrefed exactly once.
-        let unrefed_digests = UNREFED_DIGESTS.lock();
-        assert_eq!(
-            unrefed_digests.len(),
-            1,
-            "Expected exactly 1 unrefed digest"
+        let unrefed_owners = UNREFED_OWNERS.lock();
+        assert_eq!(unrefed_owners.len(), 1, "Expected exactly 1 unrefed digest");
+        assert!(
+            Weak::ptr_eq(&unrefed_owners[0], &small_owner),
+            "Expected the removed generation to match"
         );
-        assert_eq!(unrefed_digests[0], small_digest, "Expected digest to match");
     }
 
     Ok(())
@@ -1808,7 +1805,8 @@ async fn delayed_eviction_preserves_reinserted_digest_file() -> Result<(), Error
             key: StoreKey<'a>,
         ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
             if key == StoreKey::Digest(self.digest) {
-                if let Some(sender) = self.sender.lock().take() {
+                let sender = self.sender.lock().take();
+                if let Some(sender) = sender {
                     let _ = sender.send(());
                 }
             }
@@ -1840,17 +1838,17 @@ async fn delayed_eviction_preserves_reinserted_digest_file() -> Result<(), Error
                     entered_tx.send(()).map_err(|()| {
                         make_err!(Code::Internal, "Could not signal handler entry")
                     })?;
-                    release_rx.await.map_err(|_| {
-                        make_err!(Code::Internal, "Handler release sender dropped")
-                    })?;
+                    release_rx
+                        .await
+                        .map_err(|_| make_err!(Code::Internal, "Handler release sender dropped"))?;
                     fs::metadata(path).await?;
                     Ok(())
                 })
                 .await
         });
-        entered_rx.await.map_err(|_| {
-            make_err!(Code::Internal, "Handler did not enter")
-        })?;
+        entered_rx
+            .await
+            .map_err(|_| make_err!(Code::Internal, "Handler did not enter"))?;
 
         let (removed_tx, removed_rx) = oneshot::channel();
         Arc::clone(&store).register_remove_callback(Arc::new(RemovalObserved {
@@ -1858,19 +1856,18 @@ async fn delayed_eviction_preserves_reinserted_digest_file() -> Result<(), Error
             sender: Mutex::new(Some(removed_tx)),
         }))?;
         let eviction_store = Arc::clone(&store);
-        let eviction = tokio::spawn(async move {
-            eviction_store.update_oneshot(other, VALUE2.into()).await
-        });
-        removed_rx.await.map_err(|_| {
-            make_err!(Code::Internal, "Digest was not removed from the map")
-        })?;
+        let eviction =
+            tokio::spawn(async move { eviction_store.update_oneshot(other, VALUE2.into()).await });
+        removed_rx
+            .await
+            .map_err(|_| make_err!(Code::Internal, "Digest was not removed from the map"))?;
         assert_eq!(store.has(digest).await?, None);
 
         store.update_oneshot(digest, VALUE1.into()).await?;
         assert_eq!(store.has(digest).await?, Some(VALUE1.len() as u64));
-        release_tx.send(()).map_err(|()| {
-            make_err!(Code::Internal, "Handler exited before release")
-        })?;
+        release_tx
+            .send(())
+            .map_err(|()| make_err!(Code::Internal, "Handler exited before release"))?;
         handler.await.err_tip(|| "Handler task failed")??;
         eviction.await.err_tip(|| "Eviction task failed")??;
 
@@ -2264,5 +2261,383 @@ async fn unref_does_not_orphan_content_file_when_temp_dir_missing() -> Result<()
         "content file must remain intact after a failed unref rename"
     );
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[nativelink_test]
+async fn executable_bytes_share_the_primary_eviction_budget() -> Result<(), Error> {
+    let first = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let second = DigestInfo::try_new(HASH2, VALUE2.len())?;
+    let third = DigestInfo::try_new(
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        VALUE1.len(),
+    )?;
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        block_size: 8,
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 49,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+    store.update_oneshot(first, VALUE1.into()).await?;
+    store.update_oneshot(second, VALUE2.into()).await?;
+    store
+        .with_executable_hardlink_source(&first, |path| async move {
+            assert_eq!(fs::metadata(path).await?.len(), 10);
+            Ok(())
+        })
+        .await?;
+    assert_eq!(
+        store.has(first).await?,
+        Some(16),
+        "reported size remains primary block rounding"
+    );
+    store.update_oneshot(third, VALUE1.into()).await?;
+    assert_eq!(
+        store.has(second).await?,
+        None,
+        "the executable copy must consume cache capacity"
+    );
+    assert_eq!(store.has(third).await?, Some(16));
+    assert_eq!(
+        store.get_file_entry_for_digest(&first).await?.data_size(),
+        10
+    );
+    assert!(
+        store
+            .get_eviction_snapshot()
+            .to_string()
+            .starts_with("Bytes: 48 of 49")
+    );
+    store
+        .with_executable_hardlink_source(&first, |path| async move {
+            assert_eq!(fs::metadata(path).await?.len(), 10);
+            Ok(())
+        })
+        .await?;
+    assert_eq!(
+        store.has(third).await?,
+        Some(16),
+        "a variant hit cannot charge its bytes twice"
+    );
+    assert!(
+        store
+            .get_eviction_snapshot()
+            .to_string()
+            .starts_with("Bytes: 48 of 49")
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[nativelink_test]
+async fn executable_over_capacity_returns_without_creating_a_copy() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: make_temp_path("temp_path"),
+        block_size: 1,
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 15,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.with_executable_hardlink_source(&digest, |_| async { Ok(()) }),
+    )
+    .await
+    .err_tip(|| "over-capacity executable admission did not terminate")?;
+    assert_eq!(
+        result.expect_err("both physical copies do not fit").code,
+        Code::ResourceExhausted
+    );
+    assert_eq!(store.has(digest).await?, None);
+    assert!(
+        store
+            .get_eviction_snapshot()
+            .to_string()
+            .starts_with("Bytes: 0 of 15")
+    );
+    let variant = format!("{content_path}.exec/{DIGEST_FOLDER}/{digest}");
+    assert_eq!(
+        fs::metadata(&variant)
+            .await
+            .expect_err("no executable was published")
+            .code,
+        Code::NotFound
+    );
+    assert_eq!(
+        fs::metadata(format!("{variant}.tmp"))
+            .await
+            .expect_err("no temporary copy was allocated")
+            .code,
+        Code::NotFound
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[nativelink_test]
+async fn failed_executable_publish_removes_temp_before_releasing_charge() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: make_temp_path("temp_path"),
+            block_size: 8,
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes: 100,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        |from, to| {
+            if to.to_string_lossy().contains(".exec/") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected publication failure",
+                ));
+            }
+            std::fs::rename(from, to)
+        },
+    )
+    .await?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let variant = format!("{content_path}.exec/{DIGEST_FOLDER}/{digest}");
+    for _ in 0..2 {
+        store
+            .with_executable_hardlink_source(&digest, |_| async { Ok(()) })
+            .await
+            .expect_err("executable publication is deliberately refused");
+        assert_eq!(
+            fs::metadata(format!("{variant}.tmp"))
+                .await
+                .expect_err("failed private copy was removed")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            fs::metadata(&variant)
+                .await
+                .expect_err("failed copy was not published")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(store.has(digest).await?, Some(16));
+        assert!(
+            store
+                .get_eviction_snapshot()
+                .to_string()
+                .starts_with("Bytes: 16 of 100")
+        );
+    }
+    assert_eq!(
+        store.get_part_unchunked(digest, 0, None).await?,
+        Bytes::from_static(VALUE1.as_bytes())
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn startup_loaded_reader_keeps_its_inode_after_replacement() -> Result<(), Error> {
+    let spec = FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    };
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    {
+        let original = FilesystemStore::<FileEntryImpl>::new(&spec).await?;
+        original.update_oneshot(digest, VALUE1.into()).await?;
+    }
+    let reopened = FilesystemStore::<FileEntryImpl>::new(&spec).await?;
+    let old_reader = reopened.get_file_entry_for_digest(&digest).await?;
+    reopened.update_oneshot(digest, VALUE2.into()).await?;
+    let mut old_contents = String::new();
+    old_reader
+        .read_file_part(0, u64::MAX)
+        .await?
+        .read_to_string(&mut old_contents)
+        .await?;
+    assert_eq!(old_contents, VALUE1);
+    assert_eq!(
+        reopened.get_part_unchunked(digest, 0, None).await?,
+        Bytes::from_static(VALUE2.as_bytes())
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[nativelink_test]
+async fn unreclaimed_executable_temporary_blocks_allocations_until_reopen() -> Result<(), Error> {
+    let spec = FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        block_size: 1,
+        ..Default::default()
+    };
+    let failed = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let cached = DigestInfo::try_new(HASH2, VALUE2.len())?;
+    let fresh = DigestInfo::new([3; 32], 10);
+    let store =
+        FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(&spec, |from, to| {
+            let target = to.to_string_lossy();
+            if target.contains(".exec/") && target.contains(HASH1) {
+                // Replacing the private temp with a directory makes unlink fail on every uid.
+                std::fs::remove_file(from)?;
+                std::fs::create_dir(from)?;
+                return Err(std::io::Error::other(
+                    "injected publication and cleanup failure",
+                ));
+            }
+            std::fs::rename(from, to)
+        })
+        .await?;
+    store.update_oneshot(failed, VALUE1.into()).await?;
+    store.update_oneshot(cached, VALUE2.into()).await?;
+    store
+        .with_executable_hardlink_source(&cached, |_| async { Ok(()) })
+        .await?;
+    store
+        .with_executable_hardlink_source(&failed, |_| async { Ok(()) })
+        .await
+        .expect_err("private temporary cleanup fails");
+    assert!(logs_contain(
+        "Unreclaimed filesystem allocation prevents new allocations"
+    ));
+    assert_eq!(
+        store
+            .update_oneshot(fresh, VALUE1.into())
+            .await
+            .expect_err("new upload refused")
+            .code,
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        store
+            .with_executable_hardlink_source(&failed, |_| async { Ok(()) })
+            .await
+            .expect_err("new executable allocation refused")
+            .code,
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        store.get_part_unchunked(failed, 0, None).await?,
+        Bytes::from_static(VALUE1.as_bytes())
+    );
+    store
+        .with_executable_hardlink_source(&cached, |path| async move {
+            assert_eq!(fs::metadata(path).await?.len(), 10);
+            Ok(())
+        })
+        .await?;
+    assert!(matches!(
+        HealthStatusIndicator::check_health(&*store, Cow::Borrowed("test")).await,
+        HealthStatus::Failed { .. }
+    ));
+    store
+        .get_evicting_map()
+        .remove(&StoreKey::Digest(failed))
+        .await;
+    assert_eq!(
+        store
+            .update_oneshot(fresh, VALUE1.into())
+            .await
+            .expect_err("eviction cannot clear the allocation latch")
+            .code,
+        Code::ResourceExhausted
+    );
+    let temporary = format!("{}.exec/{DIGEST_FOLDER}/{failed}.tmp", spec.content_path);
+    assert!(fs::metadata(&temporary).await?.is_dir());
+    drop(store);
+
+    let reopened = FilesystemStore::<FileEntryImpl>::new(&spec).await?;
+    assert_eq!(
+        fs::metadata(&temporary)
+            .await
+            .expect_err("reopen must clear failed executable storage")
+            .code,
+        Code::NotFound
+    );
+    reopened.update_oneshot(fresh, VALUE1.into()).await?;
+    reopened
+        .with_executable_hardlink_source(&fresh, |_| async { Ok(()) })
+        .await?;
+    assert!(matches!(
+        HealthStatusIndicator::check_health(&*reopened, Cow::Borrowed("test")).await,
+        HealthStatus::Ok { .. }
+    ));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn missing_primary_lookup_preserves_typed_reapi_recovery() -> Result<(), Error> {
+    use nativelink_proto::google::rpc::PreconditionFailure;
+    use nativelink_util::action_messages::{ActionResult, to_execute_response};
+    use prost::Message;
+
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await?;
+    let error = store
+        .get_file_entry_for_digest(&digest)
+        .await
+        .expect_err("blob is absent");
+    assert_eq!(error.code, Code::NotFound);
+    let response = to_execute_response(ActionResult {
+        error: Some(error),
+        ..Default::default()
+    });
+    let status = response.status.expect("error status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32);
+    assert_eq!(status.details.len(), 1);
+    assert_eq!(
+        status.details[0].type_url,
+        "type.googleapis.com/google.rpc.PreconditionFailure"
+    );
+    let detail = PreconditionFailure::decode(status.details[0].value.as_slice())?;
+    assert_eq!(detail.violations.len(), 1);
+    assert_eq!(detail.violations[0].r#type, "MISSING");
+    assert_eq!(
+        detail.violations[0].subject,
+        format!("blobs/{}/{}", digest.packed_hash(), digest.size_bytes())
+    );
+
+    let empty = DigestInfo::try_new(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        0,
+    )?;
+    let empty_error = store
+        .get_file_entry_for_digest(&empty)
+        .await
+        .expect_err("empty blobs have no backing file");
+    assert_eq!(empty_error.context, ErrorContext::None);
+    let invalid = DigestInfo::try_new("invalid", 10).expect_err("hash is malformed");
+    let response = to_execute_response(ActionResult {
+        error: Some(invalid),
+        ..Default::default()
+    });
+    assert!(
+        response
+            .status
+            .expect("invalid hash status")
+            .details
+            .is_empty()
+    );
     Ok(())
 }

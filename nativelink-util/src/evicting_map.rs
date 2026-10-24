@@ -44,6 +44,7 @@ pub struct SerializedLRU<K> {
 #[derive(Debug)]
 struct EvictionItem<T: LenEntry + Debug> {
     seconds_since_anchor: i32,
+    weight: u64,
     data: T,
 }
 
@@ -53,6 +54,13 @@ pub trait LenEntry: 'static {
 
     /// Returns `true` if `self` has zero length.
     fn is_empty(&self) -> bool;
+
+    /// Starts generation-specific cleanup when an item is removed from the map.
+    /// Called under the map mutex: only clone state and start owned work here.
+    /// The returned future must own its state and is awaited outside the mutex.
+    fn on_remove(&self) -> impl Future<Output = ()> + Send + 'static {
+        core::future::ready(())
+    }
 
     /// This will be called when object is removed from map.
     /// Note: There may still be a reference to it held somewhere else, which
@@ -64,8 +72,7 @@ pub trait LenEntry: 'static {
     /// program safely shutting down and calling the Drop method on each object,
     /// which if you are deleting items you may not want to do.
     /// It is undefined behavior to have `unref()` called more than once.
-    /// During the execution of `unref()` no items can be added or removed to/from
-    /// the `EvictionMap` globally (including inside `unref()`).
+    /// Runs outside the map mutex; other keys and replacement generations may change concurrently.
     #[inline]
     fn unref(&self) -> impl Future<Output = ()> + Send {
         core::future::ready(())
@@ -81,6 +88,10 @@ impl<T: LenEntry + Send + Sync> LenEntry for Arc<T> {
     #[inline]
     fn is_empty(&self) -> bool {
         T::is_empty(self.as_ref())
+    }
+
+    fn on_remove(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.as_ref().on_remove()
     }
 
     #[inline]
@@ -105,7 +116,7 @@ struct State<
 > {
     lru: LruCache<K, EvictionItem<T>>,
     btree: Option<BTreeSet<K>>,
-    #[metric(help = "Total size of all items in the store")]
+    #[metric(help = "Total recorded eviction charge, including reserved allocations")]
     sum_store_size: u64,
 
     #[metric(help = "Number of bytes evicted from the store")]
@@ -147,20 +158,21 @@ impl<
         if let Some(btree) = &mut self.btree {
             btree.remove(key);
         }
-        self.sum_store_size -= eviction_item.data.len();
+        self.sum_store_size -= eviction_item.weight;
         if replaced {
             self.replaced_items.inc();
-            self.replaced_bytes.add(eviction_item.data.len());
+            self.replaced_bytes.add(eviction_item.weight);
         } else {
             self.evicted_items.inc();
-            self.evicted_bytes.add(eviction_item.data.len());
+            self.evicted_bytes.add(eviction_item.weight);
         }
 
-        let callbacks = self
+        let mut callbacks: Vec<RemoveFuture> = self
             .remove_callbacks
             .iter()
             .map(|callback| callback.callback(key))
             .collect();
+        callbacks.push(Box::pin(eviction_item.data.on_remove()));
 
         // Return the data for deferred unref outside of lock
         (eviction_item.data.clone(), callbacks)
@@ -496,8 +508,7 @@ where
     ///
     /// A read never cascades into other entries — only the queried key is
     /// ever touched. Global eviction (size/count overflow trim) runs on
-    /// inserts; it is not driven by reads, since `sum_store_size` cannot
-    /// grow without an insert.
+    /// inserts or explicit reweighting; reads never increase the recorded charge.
     pub async fn get(&self, key: &Q) -> Option<T> {
         // Lazily reap *only* the requested entry if it is itself expired;
         // leave the rest for inserts (which already run the global eviction
@@ -532,6 +543,60 @@ where
         }
 
         data
+    }
+
+    /// Checks the current generation without refreshing or evicting any entry.
+    pub fn contains_if<F>(&self, key: &Q, matches: F) -> bool
+    where
+        F: FnOnce(&T) -> bool,
+    {
+        self.state
+            .lock()
+            .lru
+            .peek(key)
+            .is_some_and(|entry| matches(&entry.data))
+    }
+
+    /// Changes only the eviction charge of a matching generation, preserving reported data sizes.
+    /// Returns false if the generation was absent, the charge overflowed, or admission evicted it.
+    /// Callers must not hold locks needed by removal callbacks or `unref` while awaiting this.
+    pub async fn reweight_if<F>(&self, key: &Q, weight: u64, matches: F) -> bool
+    where
+        F: FnOnce(&T) -> bool + Send,
+    {
+        let (retained, items, callbacks) = {
+            let mut state = self.state.lock();
+            let Some(entry) = state.lru.peek(key) else {
+                return false;
+            };
+            if !matches(&entry.data) {
+                return false;
+            }
+            let previous = entry.weight;
+            let Some(total) = state
+                .sum_store_size
+                .checked_sub(previous)
+                .and_then(|total| total.checked_add(weight))
+            else {
+                return false;
+            };
+            state
+                .lru
+                .peek_mut(key)
+                .expect("matching entry exists")
+                .weight = weight;
+            state.sum_store_size = total;
+            if weight > previous {
+                state.lifetime_inserted_bytes.add(weight - previous);
+            }
+            let (items, callbacks) = self.evict_items(&mut state);
+            (state.lru.peek(key).is_some(), items, callbacks)
+        };
+        let mut callbacks: FuturesUnordered<_> = callbacks.into_iter().collect();
+        while callbacks.next().await.is_some() {}
+        let mut unrefs: FuturesUnordered<_> = items.iter().map(LenEntry::unref).collect();
+        while unrefs.next().await.is_some() {}
+        retained
     }
 
     /// Returns the replaced item if any.
@@ -626,6 +691,7 @@ where
             let new_item_size = data.len();
             let eviction_item = EvictionItem {
                 seconds_since_anchor,
+                weight: new_item_size,
                 data,
             };
 

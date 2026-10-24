@@ -681,6 +681,12 @@ pub struct FilesystemSpec {
     /// Policy used to evict items out of the store. Failure to set this
     /// value will cause items to never be removed from the store causing
     /// infinite memory usage.
+    ///
+    /// The byte limit includes block-rounded primary files and reserved executable
+    /// copies on Unix. Reported blob sizes remain primary-file sizes. Pinned retired
+    /// files, in-flight uploads and worker directories require separate capacity.
+    /// An unreclaimed file cleanup failure stops new allocations until the filesystem
+    /// is recovered and the store is reopened; existing cached reads remain available.
     pub eviction_policy: Option<EvictionPolicy>,
 
     /// The block size of the filesystem for the running machine
