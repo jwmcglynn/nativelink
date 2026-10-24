@@ -38,7 +38,9 @@ use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs, make_temp_path};
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
-use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
+use nativelink_util::store_trait::{
+    RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+};
 use nativelink_util::{background_spawn, spawn};
 use opentelemetry::context::{Context, FutureExt as OtelFutureExt};
 use parking_lot::Mutex;
@@ -1788,6 +1790,100 @@ async fn executable_variant_remains_pinned_through_materialization_handler() -> 
     assert_eq!(err.code, Code::NotFound);
 
     Ok(())
+}
+
+/// A deferred eviction must not rename the replacement generation's content file.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn delayed_eviction_preserves_reinserted_digest_file() -> Result<(), Error> {
+    #[derive(Debug)]
+    struct RemovalObserved {
+        digest: DigestInfo,
+        sender: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl RemoveItemCallback for RemovalObserved {
+        fn callback<'a>(
+            &'a self,
+            key: StoreKey<'a>,
+        ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            if key == StoreKey::Digest(self.digest) {
+                if let Some(sender) = self.sender.lock().take() {
+                    let _ = sender.send(());
+                }
+            }
+            Box::pin(async {})
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+        let other = DigestInfo::try_new(HASH2, VALUE2.len())?;
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: make_temp_path("temp_path"),
+            block_size: 1,
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await?;
+        store.update_oneshot(digest, VALUE1.into()).await?;
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let handler_store = Arc::clone(&store);
+        let handler = tokio::spawn(async move {
+            handler_store
+                .with_executable_hardlink_source(&digest, move |path| async move {
+                    entered_tx.send(()).map_err(|()| {
+                        make_err!(Code::Internal, "Could not signal handler entry")
+                    })?;
+                    release_rx.await.map_err(|_| {
+                        make_err!(Code::Internal, "Handler release sender dropped")
+                    })?;
+                    fs::metadata(path).await?;
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.map_err(|_| {
+            make_err!(Code::Internal, "Handler did not enter")
+        })?;
+
+        let (removed_tx, removed_rx) = oneshot::channel();
+        Arc::clone(&store).register_remove_callback(Arc::new(RemovalObserved {
+            digest,
+            sender: Mutex::new(Some(removed_tx)),
+        }))?;
+        let eviction_store = Arc::clone(&store);
+        let eviction = tokio::spawn(async move {
+            eviction_store.update_oneshot(other, VALUE2.into()).await
+        });
+        removed_rx.await.map_err(|_| {
+            make_err!(Code::Internal, "Digest was not removed from the map")
+        })?;
+        assert_eq!(store.has(digest).await?, None);
+
+        store.update_oneshot(digest, VALUE1.into()).await?;
+        assert_eq!(store.has(digest).await?, Some(VALUE1.len() as u64));
+        release_tx.send(()).map_err(|()| {
+            make_err!(Code::Internal, "Handler exited before release")
+        })?;
+        handler.await.err_tip(|| "Handler task failed")??;
+        eviction.await.err_tip(|| "Eviction task failed")??;
+
+        assert_eq!(store.has(digest).await?, Some(VALUE1.len() as u64));
+        assert_eq!(
+            store.get_part_unchunked(digest, 0, None).await?,
+            Bytes::from_static(VALUE1.as_bytes()),
+            "a present map entry must retain its replacement content file"
+        );
+        Ok(())
+    })
+    .await
+    .err_tip(|| "Replacement or eviction did not finish within the bounded test")?
 }
 
 /// Cancellation while the blocking publish is running must not release the
